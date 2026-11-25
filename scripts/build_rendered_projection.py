@@ -2,13 +2,20 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import re
+import stat
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
 
 from schema_contract import choose_enum, ensure_required_fields, validate_instance
+from render_binding import compute_view_hash
+from immutable_receipt import assert_new, write_new
+from validate_pack import load_yaml as load_bounded_yaml
 
 PROFILE_KIND = "PRIME_CANON_RENDER_PROFILE_V1"
 PLAN_KIND = "PRIME_CANON_RENDER_PLAN_V1"
@@ -23,17 +30,85 @@ def utc_now() -> str:
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-def sha256_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def open_rendered_directory(repo: Path) -> int:
+    """Open the output directory without following either parent component."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        repo_fd = os.open(repo, flags)
+        try:
+            views_fd = os.open("views", flags, dir_fd=repo_fd)
+            try:
+                try:
+                    os.mkdir("rendered", dir_fd=views_fd)
+                except FileExistsError:
+                    pass
+                return os.open("rendered", flags, dir_fd=views_fd)
+            finally:
+                os.close(views_fd)
+        finally:
+            os.close(repo_fd)
+    except OSError as exc:
+        raise SystemExit(f"unsafe rendered output directory: {exc}") from exc
+
+
+def check_rendered_destination(directory_fd: int, filename: str) -> None:
+    try:
+        mode = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False).st_mode
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(mode):
+        raise SystemExit(f"unsafe rendered output destination: {filename} is not a regular file")
+
+
+def write_rendered_projection(repo: Path, subject_slug: str, rendered_text: str) -> str:
+    filename = f"{subject_slug}.md"
+    directory_fd = open_rendered_directory(repo)
+    temporary_name = f".{filename}.{uuid.uuid4().hex}.tmp"
+    try:
+        check_rendered_destination(directory_fd, filename)
+        fd = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o644,
+            dir_fd=directory_fd,
+        )
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(rendered_text.encode("utf-8"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            # A replacement symlink cannot redirect os.replace, but reject it anyway.
+            check_rendered_destination(directory_fd, filename)
+            os.replace(
+                temporary_name,
+                filename,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+        finally:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+    finally:
+        os.close(directory_fd)
+    return sha256_text(rendered_text)
 
 def load_yaml(path: Path):
     if not path.exists():
         raise SystemExit(f"missing yaml: {path}")
-    return yaml.safe_load(path.read_text(encoding="utf-8"))
+    return load_bounded_yaml(path)
 
 def main() -> None:
     repo = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(".").resolve()
     subject_slug = sys.argv[2] if len(sys.argv) > 2 else "subject-0001"
+    generation = sys.argv[3] if len(sys.argv) > 3 else "default"
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", subject_slug):
+        raise SystemExit("invalid subject slug")
+    if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", generation):
+        raise SystemExit("invalid render generation")
+    suffix = "" if generation == "default" else f"-{generation}"
 
     corpus_index_path = repo / "canon" / "corpora" / subject_slug / "index.yaml"
     view_path = repo / "views" / "current" / f"{subject_slug}.yaml"
@@ -55,10 +130,21 @@ def main() -> None:
     if not receipt_dir.exists():
         raise SystemExit(f"missing receipt dir: {receipt_dir}")
 
-    rendered_path.parent.mkdir(parents=True, exist_ok=True)
+    # Refuse a rerun before changing nodes, the view, or rendered output.
+    execution_path = receipt_dir / f"render-execution{suffix}.yaml"
+    drift_path = receipt_dir / f"render-drift{suffix}.yaml"
+    assert_new(repo, execution_path)
+    assert_new(repo, drift_path)
 
-    corpus = yaml.safe_load(corpus_index_path.read_text(encoding="utf-8"))
-    view = yaml.safe_load(view_path.read_text(encoding="utf-8"))
+    # Reject unsafe output leaves and parent components before mutating nodes or views.
+    rendered_fd = open_rendered_directory(repo)
+    try:
+        check_rendered_destination(rendered_fd, rendered_path.name)
+    finally:
+        os.close(rendered_fd)
+
+    corpus = load_yaml(corpus_index_path)
+    view = load_yaml(view_path)
     profile_cfg = load_yaml(profile_cfg_path)
     order_cfg = load_yaml(order_cfg_path)
     targets_cfg = load_yaml(targets_cfg_path)
@@ -68,9 +154,9 @@ def main() -> None:
     view_id = view["spec"]["view_id"]
     now = utc_now()
     rendered_rel_path = f"views/rendered/{subject_slug}.md"
-    execution_receipt_id = f"pc.render_execution_receipt.{subject_slug}.default"
-    drift_receipt_id = f"pc.render_drift_receipt.{subject_slug}.default"
-    plan_id = f"pc.render_plan.{subject_slug}.default"
+    execution_receipt_id = f"pc.render_execution_receipt.{subject_slug}.{generation}"
+    drift_receipt_id = f"pc.render_drift_receipt.{subject_slug}.{generation}"
+    plan_id = f"pc.render_plan.{subject_slug}.{generation}"
 
     default_output_format = str(profile_cfg["default_output_format"])
     target_projection_flag = str(profile_cfg["target_projection_flag"])
@@ -271,7 +357,7 @@ def main() -> None:
         node_path = node_dir / f"node-{seq}.yaml"
         if not node_path.exists():
             raise SystemExit(f"missing node file for {node_id}: {node_path}")
-        node = yaml.safe_load(node_path.read_text(encoding="utf-8"))
+        node = load_yaml(node_path)
 
         flags = list(node["spec"].get("active_projection_flags", []))
         for item in default_projection_flags:
@@ -340,14 +426,9 @@ def main() -> None:
         lines.append(f"- render_plan_ref: `{plan_id}`")
 
     rendered_text = "\n".join(lines) + "\n"
-    rendered_path.write_text(rendered_text, encoding="utf-8")
-    output_sha256 = sha256_file(rendered_path)
+    output_sha256 = write_rendered_projection(repo, subject_slug, rendered_text)
 
-    prior_receipts = [
-        ref for ref in view["spec"].get("derivation_receipt_refs", [])
-        if not ref.endswith(".rendered-projection")
-        and not ref.endswith(".default")
-    ]
+    prior_receipts = list(view["spec"].get("derivation_receipt_refs", []))
 
     execution_receipt = {
         "kind": EXEC_KIND,
@@ -365,7 +446,7 @@ def main() -> None:
             "identity": {
                 "corpus_id": corpus_id,
                 "subject_slug": subject_slug,
-                "canonical_home": f"receipts/immutable/{subject_slug}/render-execution.yaml",
+                "canonical_home": str(execution_path.relative_to(repo)),
             },
             "lineage": {
                 "source_refs": sorted(set(all_source_refs)),
@@ -396,7 +477,7 @@ def main() -> None:
             },
             "operational": {
                 "lane_ref": "rendered-projection",
-                "repo_home": f"receipts/immutable/{subject_slug}/render-execution.yaml",
+                "repo_home": str(execution_path.relative_to(repo)),
                 "active_state": "active",
                 "mirror_permissions": "local_only",
                 "route_destination": "export-prep",
@@ -435,15 +516,7 @@ def main() -> None:
     view["spec"]["rendered_projection_refs"] = [rendered_rel_path]
     view["spec"]["derivation_receipt_refs"] = prior_receipts + [execution_receipt_id, drift_receipt_id]
     view["spec"]["generated_at"] = now
-    view["spec"]["view_hash"] = sha256_text(
-        "|".join(
-            node_ids
-            + list(view["spec"].get("active_edge_refs", []))
-            + list(view["spec"].get("active_contradiction_refs", []))
-            + list(view["spec"].get("unresolved_blocker_refs", []))
-            + [rendered_rel_path, execution_receipt_id, drift_receipt_id, corpus_id, now]
-        )
-    )
+    view["spec"]["view_hash"] = compute_view_hash(repo, subject_slug, view)
 
     ensure_required_fields(repo, VIEW_KIND, view["spec"])
     validate_instance(repo, view)
@@ -467,7 +540,7 @@ def main() -> None:
             "identity": {
                 "corpus_id": corpus_id,
                 "subject_slug": subject_slug,
-                "canonical_home": f"receipts/immutable/{subject_slug}/render-drift.yaml",
+                "canonical_home": str(drift_path.relative_to(repo)),
             },
             "lineage": {
                 "source_refs": sorted(set(all_source_refs)),
@@ -498,7 +571,7 @@ def main() -> None:
             },
             "operational": {
                 "lane_ref": "rendered-projection",
-                "repo_home": f"receipts/immutable/{subject_slug}/render-drift.yaml",
+                "repo_home": str(drift_path.relative_to(repo)),
                 "active_state": "active",
                 "mirror_permissions": "local_only",
                 "route_destination": "export-prep",
@@ -528,8 +601,8 @@ def main() -> None:
     ensure_required_fields(repo, DRIFT_KIND, drift_receipt["spec"])
     validate_instance(repo, drift_receipt)
 
-    (repo / execution_receipt["attributes"]["identity"]["canonical_home"]).write_text(yaml.safe_dump(execution_receipt, sort_keys=False), encoding="utf-8")
-    (repo / drift_receipt["attributes"]["identity"]["canonical_home"]).write_text(yaml.safe_dump(drift_receipt, sort_keys=False), encoding="utf-8")
+    write_new(repo, execution_path, execution_receipt)
+    write_new(repo, drift_path, drift_receipt)
 
     corpus["metadata"]["updated_at"] = now
     corpus["attributes"]["temporal"]["reduced_at"] = now
