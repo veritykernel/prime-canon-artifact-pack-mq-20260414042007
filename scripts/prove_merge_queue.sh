@@ -18,8 +18,13 @@ WORKFLOW_FILE="publish-guard-check.yml"
 WORKFLOW_NAME="publish-guard-check"
 PROOF_BRANCH="cycle-2/mq-proof-$RUN_ID"
 CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+RULESET_DIR=""
 
 cleanup() {
+  if [ -n "$RULESET_DIR" ]; then
+    rm -f -- "$RULESET_DIR/ruleset.json" || true
+    rmdir -- "$RULESET_DIR" || true
+  fi
   git checkout "$CURRENT_BRANCH" >/dev/null 2>&1 || true
   if git show-ref --verify --quiet "refs/heads/$PROOF_BRANCH"; then
     git branch -D "$PROOF_BRANCH" >/dev/null 2>&1 || true
@@ -88,7 +93,11 @@ if [ "$STATUS" != "completed" ] || [ "$CONCLUSION" != "success" ]; then
   exit 1
 fi
 
-cat > /tmp/prime_canon_merge_queue_ruleset.json <<'JSON'
+RULESET_DIR="$(mktemp -d /tmp/prime-canon-merge-queue.XXXXXXXX)"
+chmod 700 "$RULESET_DIR"
+RULESET_FILE="$RULESET_DIR/ruleset.json"
+umask 077
+cat > "$RULESET_FILE" <<'JSON'
 {
   "name": "required-ci-publish-guard-main-mq",
   "target": "branch",
@@ -131,9 +140,9 @@ JSON
 RULESET_ID="$(gh api "repos/$MQ_REPO/rulesets" --jq '.[] | select(.name=="required-ci-publish-guard-main-mq") | .id' 2>/dev/null | head -n1 || true)"
 
 if [ -n "${RULESET_ID:-}" ]; then
-  gh api --method PUT -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/rulesets/$RULESET_ID" --input /tmp/prime_canon_merge_queue_ruleset.json >/dev/null
+  gh api --method PUT -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/rulesets/$RULESET_ID" --input "$RULESET_FILE" >/dev/null
 else
-  gh api --method POST -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/rulesets" --input /tmp/prime_canon_merge_queue_ruleset.json >/dev/null
+  gh api --method POST -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/rulesets" --input "$RULESET_FILE" >/dev/null
 fi
 
 gh pr create --repo "$MQ_REPO" --base main --head "$PROOF_BRANCH" --title "mq proof $RUN_ID" --body "Deterministic merge queue proof for publish-guard-check." >/dev/null
