@@ -88,6 +88,51 @@ class ResidualGuardTests(unittest.TestCase):
         self.assertEqual(publish(self.repo, SUBJECT), target)
         self.assertEqual(target.read_bytes(), (self.repo / "views" / "rendered" / f"{SUBJECT}.md").read_bytes())
 
+    def test_render_builder_rejects_live_output_symlink_before_other_writes(self):
+        self.stage_pack()
+        output = self.repo / "views" / "rendered" / f"{SUBJECT}.md"
+        sentinel = self.root / "outside.md"
+        sentinel.write_text("KEEP", encoding="utf-8")
+        output.unlink()
+        output.symlink_to(sentinel)
+        node = self.repo / "canon" / "nodes" / SUBJECT / "node-0001.yaml"
+        view = self.repo / "views" / "current" / f"{SUBJECT}.yaml"
+        original = (node.read_bytes(), view.read_bytes())
+
+        result = subprocess.run(
+            [sys.executable, str(SOURCE / "scripts" / "build_rendered_projection.py"),
+             str(self.repo), SUBJECT, "v2"],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsafe rendered output destination", result.stderr)
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "KEEP")
+        self.assertEqual((node.read_bytes(), view.read_bytes()), original)
+
+    def test_render_builder_rejects_dangling_output_symlink_before_other_writes(self):
+        self.stage_pack()
+        output = self.repo / "views" / "rendered" / f"{SUBJECT}.md"
+        outside = self.root / "not-created.md"
+        output.unlink()
+        output.symlink_to(outside)
+        node = self.repo / "canon" / "nodes" / SUBJECT / "node-0001.yaml"
+        view = self.repo / "views" / "current" / f"{SUBJECT}.yaml"
+        original = (node.read_bytes(), view.read_bytes())
+
+        result = subprocess.run(
+            [sys.executable, str(SOURCE / "scripts" / "build_rendered_projection.py"),
+             str(self.repo), SUBJECT, "v2"],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsafe rendered output destination", result.stderr)
+        self.assertFalse(outside.exists())
+        self.assertEqual((node.read_bytes(), view.read_bytes()), original)
+
     def test_validator_rejects_oversized_yaml(self):
         path = self.repo / "oversized.yaml"
         path.write_bytes(b"a" * (MAX_OBJECT_BYTES + 1))

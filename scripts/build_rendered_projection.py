@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import stat
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,8 +27,73 @@ NODE_KIND = "PRIME_CANON_NODE_V1"
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def sha256_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def open_rendered_directory(repo: Path) -> int:
+    """Open the output directory without following either parent component."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        repo_fd = os.open(repo, flags)
+        try:
+            views_fd = os.open("views", flags, dir_fd=repo_fd)
+            try:
+                try:
+                    os.mkdir("rendered", dir_fd=views_fd)
+                except FileExistsError:
+                    pass
+                return os.open("rendered", flags, dir_fd=views_fd)
+            finally:
+                os.close(views_fd)
+        finally:
+            os.close(repo_fd)
+    except OSError as exc:
+        raise SystemExit(f"unsafe rendered output directory: {exc}") from exc
+
+
+def check_rendered_destination(directory_fd: int, filename: str) -> None:
+    try:
+        mode = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False).st_mode
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(mode):
+        raise SystemExit(f"unsafe rendered output destination: {filename} is not a regular file")
+
+
+def write_rendered_projection(repo: Path, subject_slug: str, rendered_text: str) -> str:
+    filename = f"{subject_slug}.md"
+    directory_fd = open_rendered_directory(repo)
+    temporary_name = f".{filename}.{uuid.uuid4().hex}.tmp"
+    try:
+        check_rendered_destination(directory_fd, filename)
+        fd = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o644,
+            dir_fd=directory_fd,
+        )
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(rendered_text.encode("utf-8"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            # A replacement symlink cannot redirect os.replace, but reject it anyway.
+            check_rendered_destination(directory_fd, filename)
+            os.replace(
+                temporary_name,
+                filename,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+        finally:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+    finally:
+        os.close(directory_fd)
+    return sha256_text(rendered_text)
 
 def load_yaml(path: Path):
     if not path.exists():
@@ -68,7 +136,12 @@ def main() -> None:
     assert_new(repo, execution_path)
     assert_new(repo, drift_path)
 
-    rendered_path.parent.mkdir(parents=True, exist_ok=True)
+    # Reject unsafe output leaves and parent components before mutating nodes or views.
+    rendered_fd = open_rendered_directory(repo)
+    try:
+        check_rendered_destination(rendered_fd, rendered_path.name)
+    finally:
+        os.close(rendered_fd)
 
     corpus = load_yaml(corpus_index_path)
     view = load_yaml(view_path)
@@ -353,8 +426,7 @@ def main() -> None:
         lines.append(f"- render_plan_ref: `{plan_id}`")
 
     rendered_text = "\n".join(lines) + "\n"
-    rendered_path.write_text(rendered_text, encoding="utf-8")
-    output_sha256 = sha256_file(rendered_path)
+    output_sha256 = write_rendered_projection(repo, subject_slug, rendered_text)
 
     prior_receipts = list(view["spec"].get("derivation_receipt_refs", []))
 
