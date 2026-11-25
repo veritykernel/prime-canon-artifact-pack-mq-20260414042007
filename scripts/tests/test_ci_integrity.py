@@ -13,6 +13,10 @@ WORKFLOWS = (
     ROOT / ".github" / "workflows" / "validate-prime-canon.yml",
 )
 PINNED_USE = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
+PINNED_ACTIONS = {
+    "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+    "actions/setup-python": "6d4fd22b20465ccc0f7354476588e8df7c9ca0e0",
+}
 HASH_LOCK = re.compile(
     r"^(?P<name>[A-Za-z0-9_.-]+)==[^\s]+ "
     r"--hash=sha256:[0-9a-f]{64}$"
@@ -41,6 +45,9 @@ class CiIntegrityTests(unittest.TestCase):
                             uses = step.get("uses")
                             if uses is not None:
                                 self.assertRegex(uses, PINNED_USE)
+                                action, revision = uses.rsplit("@", 1)
+                                if action in PINNED_ACTIONS:
+                                    self.assertEqual(revision, PINNED_ACTIONS[action])
                             if uses and uses.startswith("actions/checkout@"):
                                 checkout_seen = True
                                 self.assertIs(step.get("with", {}).get("persist-credentials"), False)
