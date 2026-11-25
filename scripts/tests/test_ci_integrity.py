@@ -1,0 +1,119 @@
+from __future__ import annotations
+
+import re
+import unittest
+from pathlib import Path
+
+import yaml
+
+
+ROOT = Path(__file__).resolve().parents[2]
+PORTABLE_REQUIREMENTS = ROOT / "requirements.txt"
+CI_REQUIREMENTS = ROOT / "requirements-ci-linux-x86_64.txt"
+WORKFLOWS = (
+    ROOT / ".github" / "workflows" / "publish-guard-check.yml",
+    ROOT / ".github" / "workflows" / "validate-prime-canon.yml",
+)
+PINNED_USE = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
+PINNED_ACTIONS = {
+    "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+    "actions/setup-python": "6d4fd22b20465ccc0f7354476588e8df7c9ca0e0",
+}
+HASH_LOCK = re.compile(
+    r"^(?P<name>[A-Za-z0-9_.-]+)==[^\s]+ "
+    r"--hash=sha256:[0-9a-f]{64}$"
+)
+
+
+class CiIntegrityTests(unittest.TestCase):
+    def test_workflows_are_immutable_and_least_privilege(self):
+        for path in WORKFLOWS:
+            with self.subTest(workflow=path.name):
+                source = path.read_text(encoding="utf-8")
+                workflow = yaml.safe_load(source)
+                self.assertEqual(workflow.get("permissions"), {"contents": "read"})
+                self.assertNotIn("pull_request_target:", source)
+
+                jobs = workflow.get("jobs", {})
+                self.assertTrue(jobs)
+                for job_name, job in jobs.items():
+                    with self.subTest(workflow=path.name, job=job_name):
+                        self.assertEqual(job.get("runs-on"), "ubuntu-24.04")
+                        self.assertNotIn("permissions", job)
+
+                        checkout_seen = False
+                        setup_python_seen = False
+                        for step in job.get("steps", []):
+                            uses = step.get("uses")
+                            if uses is not None:
+                                self.assertRegex(uses, PINNED_USE)
+                                action, revision = uses.rsplit("@", 1)
+                                if action in PINNED_ACTIONS:
+                                    self.assertEqual(revision, PINNED_ACTIONS[action])
+                            if uses and uses.startswith("actions/checkout@"):
+                                checkout_seen = True
+                                self.assertIs(step.get("with", {}).get("persist-credentials"), False)
+                            if uses and uses.startswith("actions/setup-python@"):
+                                setup_python_seen = True
+                                self.assertEqual(step.get("with", {}).get("python-version"), "3.11.18")
+
+                        self.assertTrue(checkout_seen)
+                        self.assertTrue(setup_python_seen)
+
+    def test_bootstrap_uses_portable_requirements(self):
+        bootstrap = (ROOT / "scripts" / "bootstrap_python.sh").read_text(encoding="utf-8")
+        self.assertIn("python3 -m pip install -r requirements.txt", bootstrap)
+        self.assertNotIn(CI_REQUIREMENTS.name, bootstrap)
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        self.assertIn("$(PIP) install -r requirements.txt", makefile)
+        self.assertNotIn(CI_REQUIREMENTS.name, makefile)
+
+        portable_lines = [
+            line.strip()
+            for line in PORTABLE_REQUIREMENTS.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(portable_lines, ["PyYAML==6.0.4", "jsonschema==4.26.0"])
+        for line in portable_lines:
+            self.assertNotIn("--hash", line)
+            self.assertNotRegex(line.lower(), r"manylinux|macosx|win(?:32|_amd64)")
+
+    def test_validator_dependency_install_is_binary_and_hash_locked(self):
+        workflow = (ROOT / ".github" / "workflows" / "validate-prime-canon.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("--only-binary=:all:", workflow)
+        self.assertIn("--require-hashes", workflow)
+        self.assertIn(f"-r {CI_REQUIREMENTS.name}", workflow)
+        self.assertNotIn("--require-hashes -r requirements.txt", workflow)
+        self.assertIn('      - ".github/workflows/validate-prime-canon.yml"', workflow)
+        self.assertIn('      - "requirements*.txt"', workflow)
+
+        lines = [
+            line.strip()
+            for line in CI_REQUIREMENTS.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        self.assertTrue(lines)
+        locked_names = set()
+        for line in lines:
+            match = HASH_LOCK.fullmatch(line)
+            self.assertIsNotNone(match, f"dependency is not exactly hash locked: {line}")
+            locked_names.add(match.group("name").lower().replace("_", "-"))
+
+        self.assertEqual(
+            locked_names,
+            {
+                "attrs",
+                "jsonschema",
+                "jsonschema-specifications",
+                "pyyaml",
+                "referencing",
+                "rpds-py",
+                "typing-extensions",
+            },
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
