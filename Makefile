@@ -4,7 +4,7 @@ PIP ?= $(PYTHON) -m pip
 .PHONY: deps validate tree
 
 deps:
-	$(PIP) install --upgrade pyyaml jsonschema
+	$(PIP) install -r requirements.txt
 
 validate:
 	$(PYTHON) scripts/validate_pack.py .

@@ -8,6 +8,8 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[2]
+PORTABLE_REQUIREMENTS = ROOT / "requirements.txt"
+CI_REQUIREMENTS = ROOT / "requirements-ci-linux-x86_64.txt"
 WORKFLOWS = (
     ROOT / ".github" / "workflows" / "publish-guard-check.yml",
     ROOT / ".github" / "workflows" / "validate-prime-canon.yml",
@@ -58,16 +60,38 @@ class CiIntegrityTests(unittest.TestCase):
                         self.assertTrue(checkout_seen)
                         self.assertTrue(setup_python_seen)
 
+    def test_bootstrap_uses_portable_requirements(self):
+        bootstrap = (ROOT / "scripts" / "bootstrap_python.sh").read_text(encoding="utf-8")
+        self.assertIn("python3 -m pip install -r requirements.txt", bootstrap)
+        self.assertNotIn(CI_REQUIREMENTS.name, bootstrap)
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        self.assertIn("$(PIP) install -r requirements.txt", makefile)
+        self.assertNotIn(CI_REQUIREMENTS.name, makefile)
+
+        portable_lines = [
+            line.strip()
+            for line in PORTABLE_REQUIREMENTS.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(portable_lines, ["PyYAML==6.0.4", "jsonschema==4.26.0"])
+        for line in portable_lines:
+            self.assertNotIn("--hash", line)
+            self.assertNotRegex(line.lower(), r"manylinux|macosx|win(?:32|_amd64)")
+
     def test_validator_dependency_install_is_binary_and_hash_locked(self):
         workflow = (ROOT / ".github" / "workflows" / "validate-prime-canon.yml").read_text(
             encoding="utf-8"
         )
         self.assertIn("--only-binary=:all:", workflow)
         self.assertIn("--require-hashes", workflow)
+        self.assertIn(f"-r {CI_REQUIREMENTS.name}", workflow)
+        self.assertNotIn("--require-hashes -r requirements.txt", workflow)
+        self.assertIn('      - ".github/workflows/validate-prime-canon.yml"', workflow)
+        self.assertIn('      - "requirements*.txt"', workflow)
 
         lines = [
             line.strip()
-            for line in (ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
+            for line in CI_REQUIREMENTS.read_text(encoding="utf-8").splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         ]
         self.assertTrue(lines)

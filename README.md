@@ -99,6 +99,8 @@ make validate
 CI:
 
 - `.github/workflows/validate-prime-canon.yml`
+- Local bootstrap and `make deps` use portable direct pins from `requirements.txt`.
+- Ubuntu x86_64 CI alone uses the platform-specific hash lock in `requirements-ci-linux-x86_64.txt`.
 
 ## Suggested first implementation sequence
 
