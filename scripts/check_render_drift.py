@@ -4,58 +4,54 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import re
-import stat
 import sys
 from pathlib import Path
 
 import yaml
 
-from render_binding import compute_view_hash
+from render_binding import expected_render_bytes, render_snapshot
 from render_receipts import active_receipt_paths
-from validate_pack import load_yaml as load_bounded_yaml
+from safe_pack_io import read_bytes
 
 MAX_RENDER_BYTES = 16 * 1024 * 1024
 
 
-def load_yaml(path: Path) -> dict:
-    if path.is_symlink():
-        raise ValueError(f"render input is a symlink: {path}")
-    return load_bounded_yaml(path)
+def load_yaml(repo: Path, relative: str) -> dict:
+    obj = yaml.safe_load(read_bytes(repo, relative, limit=2 * 1024 * 1024))
+    if not isinstance(obj, dict):
+        raise ValueError(f"render input is not an object: {relative}")
+    return obj
 
 
-def current_output_hash(path: Path) -> str | None:
+def current_output_bytes(repo: Path, relative: str) -> bytes | None:
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        return read_bytes(repo, relative, limit=MAX_RENDER_BYTES)
     except FileNotFoundError:
         return None
-    with os.fdopen(fd, "rb") as stream:
-        info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_RENDER_BYTES:
-            raise ValueError("rendered output is not a bounded regular file")
-        raw = stream.read(MAX_RENDER_BYTES + 1)
-    if len(raw) > MAX_RENDER_BYTES:
-        raise ValueError("rendered output exceeds size limit")
-    return hashlib.sha256(raw).hexdigest()
 
 
 def inspect(repo: Path, subject_slug: str) -> tuple[str, str]:
     repo = repo.resolve(strict=True)
     if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", subject_slug):
         raise ValueError("invalid subject slug")
-    view = load_yaml(repo / "views" / "current" / f"{subject_slug}.yaml")
+    view = load_yaml(repo, f"views/current/{subject_slug}.yaml")
     execution_path, drift_path = active_receipt_paths(repo, subject_slug, view)
-    execution = load_yaml(execution_path)
-    drift = load_yaml(drift_path)
+    execution = load_yaml(repo, execution_path.relative_to(repo).as_posix())
+    drift = load_yaml(repo, drift_path.relative_to(repo).as_posix())
     view_spec, execution_spec, drift_spec = view["spec"], execution["spec"], drift["spec"]
     expected_ref = f"views/rendered/{subject_slug}.md"
-    output_sha = current_output_hash(repo / expected_ref)
-    current_view_hash = compute_view_hash(repo, subject_slug, view)
+    output = current_output_bytes(repo, expected_ref)
+    output_sha = hashlib.sha256(output).hexdigest() if output is not None else None
+    current_view_hash, render_inputs = render_snapshot(repo, subject_slug, view)
+    corpus = yaml.safe_load(render_inputs[f"canon/corpora/{subject_slug}/index.yaml"])
+    expected_output = expected_render_bytes(subject_slug, view, execution, render_inputs, corpus["spec"]["corpus_id"])
 
     if output_sha is None:
         status = "missing_output"
     elif output_sha != execution_spec.get("output_sha256"):
+        status = "out_of_sync"
+    elif output != expected_output:
         status = "out_of_sync"
     elif (current_view_hash != view_spec.get("view_hash")
           or current_view_hash != drift_spec.get("current_view_hash")

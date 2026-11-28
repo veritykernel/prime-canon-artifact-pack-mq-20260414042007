@@ -20,6 +20,7 @@ RECEIPT_KIND = "PRIME_CANON_REDUCTION_DECISION_RECEIPT_V1"
 MAX_CLAIMS = 512
 MAX_TEXT = 8192
 MAX_YAML_BYTES = 2 * 1024 * 1024
+MAX_PAIR_EVALUATIONS = 16384
 
 
 def read_yaml(path: Path) -> dict:
@@ -58,6 +59,28 @@ def claim_scope_key(claim: dict) -> str:
 
 def claim_claim_type(claim: dict) -> str:
     return str(claim["spec"].get("claim_type", "")).strip().lower()
+
+
+def candidate_pairs(claims: list[dict], token_sets: list[set[str]]) -> list[tuple[int, int]]:
+    """Only claims sharing a token or scope can meet a scout relation."""
+    tokens_to_indices: dict[str, list[int]] = {}
+    scopes_to_indices: dict[str, list[int]] = {}
+    pairs: set[tuple[int, int]] = set()
+
+    def include_prior(prior: list[int], current: int) -> None:
+        for earlier in prior:
+            pairs.add((earlier, current))
+            if len(pairs) > MAX_PAIR_EVALUATIONS:
+                raise ValueError(f"topology candidate pairs exceed {MAX_PAIR_EVALUATIONS}; split or review the batch")
+
+    for index, claim in enumerate(claims):
+        scope = claim_scope_key(claim)
+        include_prior(scopes_to_indices.setdefault(scope, []), index)
+        scopes_to_indices[scope].append(index)
+        for token in token_sets[index]:
+            include_prior(tokens_to_indices.setdefault(token, []), index)
+            tokens_to_indices[token].append(index)
+    return sorted(pairs)
 
 def build_contradiction(repo: Path, subject_slug: str, corpus_id: str, now: str, seq: int, left: dict, right: dict, source_refs: list[str], source_unit_refs: list[str]) -> dict:
     contradiction_id = f"pc.contradiction_bundle.{subject_slug}.{seq:04d}"
@@ -356,65 +379,62 @@ def main() -> None:
     supersession_refs = []
     contradiction_seq = 1
     supersession_seq = 1
-    seen_pairs = set()
-    claim_texts = []
     claim_tokens = []
     claim_negations = []
     claim_norms = []
+    claim_ids = [claim["spec"]["claim_id"] for claim in claims]
+    if len(set(claim_ids)) != len(claim_ids):
+        raise SystemExit("duplicate candidate claim ID in topology scout input")
     for claim in claims:
         body = claim["spec"]["normalized_claim_body"]
         if not isinstance(body, str) or len(body) > MAX_TEXT:
             raise SystemExit(f"claim body exceeds {MAX_TEXT} characters")
-        claim_texts.append(body)
         claim_tokens.append(tokens(body))
         claim_negations.append(has_negation(body))
         claim_norms.append(norm(body))
 
-    for i in range(len(claims)):
+    try:
+        pairs = candidate_pairs(claims, claim_tokens)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    for i, j in pairs:
         left = claims[i]
-        left_text = claim_texts[i]
         left_type = claim_claim_type(left)
-        for j in range(i + 1, len(claims)):
-            right = claims[j]
-            right_text = claim_texts[j]
-            right_type = claim_claim_type(right)
-            pair_key = tuple(sorted([left["spec"]["claim_id"], right["spec"]["claim_id"]]))
-            if pair_key in seen_pairs:
+        right = claims[j]
+        right_type = claim_claim_type(right)
+        overlap = jaccard(claim_tokens[i], claim_tokens[j])
+        source_refs = sorted(set(left["attributes"]["lineage"].get("source_refs", []) + right["attributes"]["lineage"].get("source_refs", [])))
+        source_unit_refs = sorted(set(left["attributes"]["lineage"].get("source_unit_refs", []) + right["attributes"]["lineage"].get("source_unit_refs", [])))
+
+        if overlap >= 0.60 and claim_negations[i] != claim_negations[j]:
+            contradiction = build_contradiction(repo, subject_slug, corpus_id, now, contradiction_seq, left, right, source_refs, source_unit_refs)
+            out = repo / contradiction["attributes"]["identity"]["canonical_home"]
+            write_new(repo, out, contradiction)
+            contradiction_refs.append(contradiction["metadata"]["object_id"])
+            contradiction_seq += 1
+            continue
+
+        same_scope = claim_scope_key(left) == claim_scope_key(right)
+        neither_question = left_type != "question" and right_type != "question"
+        left_norm = claim_norms[i]
+        right_norm = claim_norms[j]
+
+        if same_scope and neither_question:
+            if left_norm != right_norm and left_norm in right_norm and len(right_norm) - len(left_norm) >= 24:
+                edge = build_supersession(repo, subject_slug, corpus_id, now, supersession_seq, left, right, source_refs, source_unit_refs, "successor claim strictly contains prior claim text and adds more specific scope")
+                out = repo / edge["attributes"]["identity"]["canonical_home"]
+                write_new(repo, out, edge)
+                supersession_refs.append(edge["metadata"]["object_id"])
+                supersession_seq += 1
                 continue
-            seen_pairs.add(pair_key)
-
-            overlap = jaccard(claim_tokens[i], claim_tokens[j])
-            source_refs = sorted(set(left["attributes"]["lineage"].get("source_refs", []) + right["attributes"]["lineage"].get("source_refs", [])))
-            source_unit_refs = sorted(set(left["attributes"]["lineage"].get("source_unit_refs", []) + right["attributes"]["lineage"].get("source_unit_refs", [])))
-
-            if overlap >= 0.60 and claim_negations[i] != claim_negations[j]:
-                contradiction = build_contradiction(repo, subject_slug, corpus_id, now, contradiction_seq, left, right, source_refs, source_unit_refs)
-                out = repo / contradiction["attributes"]["identity"]["canonical_home"]
-                write_new(repo, out, contradiction)
-                contradiction_refs.append(contradiction["metadata"]["object_id"])
-                contradiction_seq += 1
+            if left_norm != right_norm and right_norm in left_norm and len(left_norm) - len(right_norm) >= 24:
+                edge = build_supersession(repo, subject_slug, corpus_id, now, supersession_seq, right, left, source_refs, source_unit_refs, "successor claim strictly contains prior claim text and adds more specific scope")
+                out = repo / edge["attributes"]["identity"]["canonical_home"]
+                write_new(repo, out, edge)
+                supersession_refs.append(edge["metadata"]["object_id"])
+                supersession_seq += 1
                 continue
-
-            same_scope = claim_scope_key(left) == claim_scope_key(right)
-            neither_question = left_type != "question" and right_type != "question"
-            left_norm = claim_norms[i]
-            right_norm = claim_norms[j]
-
-            if same_scope and neither_question:
-                if left_norm != right_norm and left_norm in right_norm and len(right_norm) - len(left_norm) >= 24:
-                    edge = build_supersession(repo, subject_slug, corpus_id, now, supersession_seq, left, right, source_refs, source_unit_refs, "successor claim strictly contains prior claim text and adds more specific scope")
-                    out = repo / edge["attributes"]["identity"]["canonical_home"]
-                    write_new(repo, out, edge)
-                    supersession_refs.append(edge["metadata"]["object_id"])
-                    supersession_seq += 1
-                    continue
-                if left_norm != right_norm and right_norm in left_norm and len(left_norm) - len(right_norm) >= 24:
-                    edge = build_supersession(repo, subject_slug, corpus_id, now, supersession_seq, right, left, source_refs, source_unit_refs, "successor claim strictly contains prior claim text and adds more specific scope")
-                    out = repo / edge["attributes"]["identity"]["canonical_home"]
-                    write_new(repo, out, edge)
-                    supersession_refs.append(edge["metadata"]["object_id"])
-                    supersession_seq += 1
-                    continue
 
     cited_object_refs = [c["spec"]["claim_id"] for c in claims] + contradiction_refs + supersession_refs
 

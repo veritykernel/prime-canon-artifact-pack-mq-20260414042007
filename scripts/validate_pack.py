@@ -11,6 +11,7 @@ from pathlib import Path
 
 import yaml
 from jsonschema import Draft202012Validator
+from object_identity import index_repo
 
 
 MAX_OBJECT_BYTES = 2 * 1024 * 1024
@@ -19,6 +20,7 @@ MAX_OBJECTS = 5000
 MAX_ERRORS = 50
 MAX_TREE_NODES = 100000
 MAX_TREE_DEPTH = 64
+MAX_SCALAR_CHARS = 65536
 
 
 def check_tree_bound(data: object) -> None:
@@ -30,6 +32,8 @@ def check_tree_bound(data: object) -> None:
         count += 1
         if count > MAX_TREE_NODES or depth > MAX_TREE_DEPTH:
             raise ValueError("YAML object exceeds tree size or depth limit")
+        if isinstance(value, (str, bytes)) and len(value) > MAX_SCALAR_CHARS:
+            raise ValueError("YAML scalar exceeds size limit")
         if isinstance(value, dict):
             stack.extend((child, depth + 1) for child in value.values())
         elif isinstance(value, list):
@@ -192,6 +196,11 @@ def main() -> int:
         if rel.startswith("receipts/immutable/") and not kind.endswith(("DECISION_V1", "RECEIPT_V1", "PACKET_V1")):
             if len(warnings) < MAX_ERRORS:
                 warnings.append(f"{rel}: immutable receipts directory usually stores receipt/decision/packet kinds only")
+
+    try:
+        index_repo(repo_root)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        errors.append(f"repository object identity index: {exc}")
 
     print(f"Validated {checked} object files.")
     if warnings:

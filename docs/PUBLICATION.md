@@ -4,16 +4,25 @@ Use `scripts/publish_rendered_subject.sh <subject-slug>` for the configured
 stage destination. The target directory must already exist. The guard accepts
 only this verified publisher or its no-effect dry run.
 
+Set `PRIME_CANON_TRUSTED_PYTHON` to a separately qualified, absolute Python
+interpreter outside the repository with the validator dependencies installed.
+The guarded route rejects an unset interpreter, symlinks, unsafe ownership or
+writable ancestors; it never sources the repository's `.venv`. The configured
+stage directory and its ancestors must also pass owner and write-permission
+checks. Publication remains held until these installed prerequisites and a
+current render generation are verified.
+
 The publisher checks the current view, render execution receipt, and drift
 receipt against the expected subject and output path. It reads the rendered
-source once, verifies the SHA-256 recorded by the execution receipt, and
+source once, independently derives the deterministic body from the governed
+node and render-policy snapshot, verifies the receipt SHA-256, and
 publishes those same bytes with an atomic replacement inside an open target
 directory. It rejects source and destination symlinks and leaves the existing
 target untouched if verification fails. A green drift receipt alone cannot
 authorize later changed bytes.
 
-The current view binds its complete spec, the exact bytes of each active canon
-node, and the four render policy files into `view_hash`. Export prep and the
+The current view binds its complete spec, the corpus index, the exact bytes of
+each active canon node, and the four render policy files into `view_hash`. Export prep and the
 publisher recompute that hash on every use. `check_render_drift.py` is read-only:
 it reports stale inputs without changing an immutable receipt or the view.
 

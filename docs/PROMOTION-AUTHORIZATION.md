@@ -14,6 +14,7 @@ The approval is a JSON object with exactly these fields:
 ```json
 {
   "kind": "PRIME_CANON_PROMOTION_APPROVAL_V1",
+  "repository_head_sha": "<full clean Git HEAD SHA reviewed by the signer>",
   "subject_slug": "subject-0001",
   "corpus_id": "pc.corpus.subject-0001",
   "corpus_sha256": "<sha256 of corpus index bytes>",
@@ -29,11 +30,13 @@ The approval is a JSON object with exactly these fields:
 }
 ```
 
-The reviewer must inspect the underlying evidence and exact frozen inputs,
+The reviewer must inspect the underlying evidence, clean repository revision, and exact frozen inputs,
 then sign the JSON bytes with an SSH key admitted by the external allowed
 signers file, using namespace `prime-canon-promotion-v1`. The allowed signers
 file must be outside the repository, root-owned, and not group or world
-writable. Repository contributors cannot establish reviewer authority by
+writable along its full ancestor chain. The verifier uses the system
+`/usr/bin/ssh-keygen` against private snapshots of the exact signature and
+allowed-signer bytes it checked. Repository contributors cannot establish reviewer authority by
 editing a checked-in identity or receipt. The operator supplies the external
 approval, its SSH signature, and the allowed signers path via
 `PRIME_CANON_APPROVAL`, `PRIME_CANON_APPROVAL_SIGNATURE`, and

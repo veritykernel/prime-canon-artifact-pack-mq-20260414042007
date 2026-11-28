@@ -13,15 +13,19 @@ import os
 import re
 import stat
 import subprocess
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
+from object_identity import index_repo
+from safe_pack_io import read_bytes
 
 SUBJECT = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 PRINCIPAL = "human:reviewer"
 NAMESPACE = "prime-canon-promotion-v1"
 MAX_FILE = 2 * 1024 * 1024
+GIT = "/usr/bin/git"
 
 
 class PromotionRejected(ValueError):
@@ -29,20 +33,11 @@ class PromotionRejected(ValueError):
 
 
 def _bytes(repo: Path, path: Path) -> bytes:
-    if not path.resolve().is_relative_to(repo.resolve()):
-        raise PromotionRejected(f"path escapes repository: {path}")
-    if path.is_symlink():
-        raise PromotionRejected(f"symlink input: {path}")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(path, flags)
-    except OSError as exc:
+        relative = path.relative_to(repo.resolve(strict=True)).as_posix()
+        return read_bytes(repo, relative, limit=MAX_FILE)
+    except (OSError, ValueError) as exc:
         raise PromotionRejected(f"cannot read input {path}: {exc}") from exc
-    with os.fdopen(fd, "rb") as stream:
-        info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE:
-            raise PromotionRejected(f"input is not a bounded regular file: {path}")
-        return stream.read(MAX_FILE + 1)
 
 
 def _yaml(repo: Path, path: Path) -> tuple[dict, bytes]:
@@ -62,26 +57,66 @@ def _digest(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def _external_file(path: Path, repo: Path, *, root_owned: bool) -> bytes:
-    if path.is_symlink() or path.resolve().is_relative_to(repo.resolve()):
-        raise PromotionRejected(f"approval material must be a regular file outside the repository: {path}")
+def repository_revision(repo: Path) -> str:
+    """Bind the human authorization to one clean committed source revision."""
+    command = [GIT, "-c", "core.fsmonitor=false", "-C", str(repo)]
+    environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "GIT_CONFIG_GLOBAL": os.devnull,
+                   "GIT_CONFIG_SYSTEM": os.devnull, "GIT_OPTIONAL_LOCKS": "0"}
     try:
-        info = path.stat()
+        head = subprocess.run(command + ["rev-parse", "--verify", "HEAD"], check=True,
+                              capture_output=True, text=True, env=environment, timeout=10).stdout.strip()
+        status = subprocess.run(command + ["status", "--porcelain", "--untracked-files=all"], check=True,
+                                capture_output=True, text=True, env=environment, timeout=10).stdout
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise PromotionRejected("cannot verify a clean committed repository revision") from exc
+    if not re.fullmatch(r"[0-9a-f]{40}", head) or status:
+        raise PromotionRejected("promotion requires a clean exact Git revision")
+    return head
+
+
+def _external_file(path: Path, repo: Path, *, root_owned: bool) -> bytes:
+    if not path.is_absolute() or ".." in path.parts or path.is_relative_to(repo.resolve(strict=True)):
+        raise PromotionRejected(f"approval material must be a regular file outside the repository: {path}")
+    directory_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for component in path.parts[1:-1]:
+            next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+            ancestor = os.fstat(directory_fd)
+            if root_owned and (ancestor.st_uid != 0 or ancestor.st_mode & 0o022):
+                raise PromotionRejected("allowed signer ancestors must be root-owned and not group/world writable")
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
     except OSError as exc:
         raise PromotionRejected(f"missing approval material: {path}") from exc
-    if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE:
-        raise PromotionRejected(f"invalid approval material: {path}")
-    if root_owned and (info.st_uid != 0 or info.st_mode & 0o022):
-        raise PromotionRejected("allowed signers must be root-owned and not group/world writable")
-    return path.read_bytes()
+    finally:
+        os.close(directory_fd)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE:
+            raise PromotionRejected(f"invalid approval material: {path}")
+        if root_owned and (info.st_uid != 0 or info.st_mode & 0o022):
+            raise PromotionRejected("allowed signers must be root-owned and not group/world writable")
+        raw = stream.read(MAX_FILE + 1)
+    if len(raw) > MAX_FILE:
+        raise PromotionRejected(f"oversized approval material: {path}")
+    return raw
+
+
+def _private_snapshot(directory_fd: int, name: str, raw: bytes) -> None:
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def verify_approval(repo: Path, approval_path: Path, signature_path: Path,
                     signers_path: Path, expected: dict, *, root_owned: bool = True) -> tuple[str, str]:
     """Return the trusted signer and signed-byte digest after checking scope."""
     raw = _external_file(approval_path, repo, root_owned=False)
-    _external_file(signature_path, repo, root_owned=False)
-    _external_file(signers_path, repo, root_owned=root_owned)
+    signature_raw = _external_file(signature_path, repo, root_owned=False)
+    signers_raw = _external_file(signers_path, repo, root_owned=root_owned)
     try:
         approval = json.loads(raw)
     except (ValueError, UnicodeError) as exc:
@@ -100,11 +135,20 @@ def verify_approval(repo: Path, approval_path: Path, signature_path: Path,
     now = datetime.now(timezone.utc)
     if issued.tzinfo is None or expires.tzinfo is None or issued > now or expires <= now or expires - issued > timedelta(days=30):
         raise PromotionRejected("approval is stale or has an invalid validity window")
-    result = subprocess.run(
-        ["ssh-keygen", "-Y", "verify", "-f", str(signers_path), "-I", PRINCIPAL,
-         "-n", NAMESPACE, "-s", str(signature_path)],
-        input=raw, capture_output=True, check=False, timeout=10,
-    )
+    with tempfile.TemporaryDirectory(prefix="prime-approval-", dir=Path(tempfile.gettempdir()).resolve()) as temp:
+        snapshot_dir = Path(temp)
+        directory_fd = os.open(snapshot_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            _private_snapshot(directory_fd, "signature", signature_raw)
+            _private_snapshot(directory_fd, "allowed_signers", signers_raw)
+        finally:
+            os.close(directory_fd)
+        result = subprocess.run(
+            ["/usr/bin/ssh-keygen", "-Y", "verify", "-f", str(snapshot_dir / "allowed_signers"),
+             "-I", PRINCIPAL, "-n", NAMESPACE, "-s", str(snapshot_dir / "signature")],
+            input=raw, capture_output=True, check=False, timeout=10,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        )
     if result.returncode != 0:
         raise PromotionRejected("human approval signature verification failed")
     return PRINCIPAL, _digest(raw)
@@ -115,6 +159,10 @@ def preflight(repo: Path, subject: str, *, approval_path: Path | None = None,
               root_owned: bool = True) -> dict:
     if not SUBJECT.fullmatch(subject):
         raise PromotionRejected("invalid subject slug")
+    try:
+        index_repo(repo)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        raise PromotionRejected(f"repository object identity rejected: {exc}") from exc
     receipt_dir = repo / "receipts" / "immutable" / subject
     corpus, corpus_raw = _yaml(repo, repo / "canon" / "corpora" / subject / "index.yaml")
     packet, packet_raw = _yaml(repo, receipt_dir / "promotion-readiness-packet.yaml")
@@ -186,6 +234,7 @@ def preflight(repo: Path, subject: str, *, approval_path: Path | None = None,
         raise PromotionRejected("external signed human approval and trusted signer store are required")
     expected = {
         "kind": "PRIME_CANON_PROMOTION_APPROVAL_V1",
+        "repository_head_sha": repository_revision(repo),
         "subject_slug": subject,
         "corpus_id": corpus_id,
         "corpus_sha256": _digest(corpus_raw),

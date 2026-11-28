@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+from object_identity import index_repo
 
 from schema_contract import choose_enum, ensure_required_fields, validate_instance
 from promotion_preflight import SUBJECT
@@ -43,6 +44,10 @@ def blast_radius_for(repo: Path, target_count: int) -> str:
 def main() -> None:
     repo = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(".").resolve()
     subject_slug = sys.argv[2] if len(sys.argv) > 2 else "subject-0001"
+    try:
+        index_repo(repo)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        raise SystemExit(f"repository object identity rejected: {exc}") from exc
     if not SUBJECT.fullmatch(subject_slug):
         raise SystemExit("invalid subject slug")
 
