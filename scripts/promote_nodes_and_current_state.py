@@ -4,14 +4,16 @@ from __future__ import annotations
 import hashlib
 import fcntl
 import os
+import stat
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
 
-from schema_contract import choose_enum, ensure_required_fields, validate_instance
-from promotion_preflight import PromotionRejected, preflight
+from schema_contract import bundle, choose_enum, ensure_required_fields, validate_instance
+from promotion_preflight import PromotionRejected, preflight, repository_revision
+from safe_pack_io import open_parent, read_bytes, write_new_bytes
 
 NODE_KIND = "PRIME_CANON_NODE_V1"
 VIEW_KIND = "PRIME_CANON_CURRENT_STATE_VIEW_V1"
@@ -28,12 +30,9 @@ def claim_seq_from_path(path: Path) -> str:
 
 def write_new(repo: Path, path: Path, obj: dict) -> None:
     """Never overwrite a prior canon object or follow an output symlink."""
-    if not path.parent.resolve().is_relative_to(repo):
-        raise PromotionRejected(f"output path escapes repository: {path}")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags, 0o644)
-    with os.fdopen(fd, "w", encoding="utf-8") as stream:
-        stream.write(yaml.safe_dump(obj, sort_keys=False))
+    relative = path.relative_to(repo).as_posix()
+    write_new_bytes(repo, relative, yaml.safe_dump(obj, sort_keys=False).encode("utf-8"),
+                    create_parents=True)
 
 def main() -> None:
     repo = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(".").resolve()
@@ -92,19 +91,32 @@ def main() -> None:
         outputs.extend((node_dir / f"node-{seq}.yaml", receipt_dir / f"promotion-node-{seq}.yaml"))
     if any(path.exists() or path.is_symlink() for path in outputs):
         raise SystemExit("promotion outputs already exist; reconcile the prior effect before retrying")
-    corpus_fd = os.open(corpus_index_path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+    if repository_revision(repo) != frozen["repository_head_sha"]:
+        raise SystemExit("promotion repository changed after signed preflight")
+    schema_raw = read_bytes(repo, "schemas/prime-canon-bundle.schema.json", limit=2 * 1024 * 1024)
+    if hashlib.sha256(schema_raw).hexdigest() != frozen["schema_sha256"]:
+        raise SystemExit("promotion schema changed after signed preflight")
+    bundle(repo)  # Pin the validated schema object before the first output.
+    corpus_parent, corpus_leaf = open_parent(repo, f"canon/corpora/{subject_slug}/index.yaml")
+    try:
+        corpus_fd = os.open(corpus_leaf, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK,
+                            dir_fd=corpus_parent)
+    finally:
+        os.close(corpus_parent)
+    corpus_info = os.fstat(corpus_fd)
+    if not stat.S_ISREG(corpus_info.st_mode) or corpus_info.st_size > 2 * 1024 * 1024:
+        os.close(corpus_fd)
+        raise SystemExit("promotion corpus is not a bounded regular file")
     corpus_stream = os.fdopen(corpus_fd, "r+b")
     fcntl.flock(corpus_stream.fileno(), fcntl.LOCK_EX)
     if hashlib.sha256(corpus_stream.read(2 * 1024 * 1024 + 1)).hexdigest() != frozen["corpus_sha256"]:
         corpus_stream.close()
         raise SystemExit("corpus changed after signed preflight; no promotion outputs written")
-    node_dir.mkdir(parents=True, exist_ok=True)
-    current_view_path.parent.mkdir(parents=True, exist_ok=True)
-
     node_ids = []
     node_receipt_ids = []
     all_source_refs = []
     all_source_unit_refs = []
+    pending_writes: list[tuple[Path, dict]] = []
 
     for claim_id in target_claim_ids:
         claim_path = claim_paths_by_id[claim_id]
@@ -303,8 +315,7 @@ def main() -> None:
         ensure_required_fields(repo, NODE_KIND, node["spec"])
         validate_instance(repo, node)
 
-        write_new(repo, repo / receipt_rel_path, receipt)
-        write_new(repo, repo / node_rel_path, node)
+        pending_writes.extend(((repo / receipt_rel_path, receipt), (repo / node_rel_path, node)))
 
         node_ids.append(node_id)
         node_receipt_ids.append(receipt_id)
@@ -471,19 +482,30 @@ def main() -> None:
     ensure_required_fields(repo, RECEIPT_KIND, lane_summary["spec"])
     validate_instance(repo, lane_summary)
 
-    write_new(repo, repo / view_rel_path, current_view)
-    write_new(repo, repo / lane_summary_rel_path, lane_summary)
-
     corpus["metadata"]["updated_at"] = now
     corpus["attributes"]["temporal"]["reduced_at"] = now
     corpus["attributes"]["temporal"]["status_since"] = now
     corpus["attributes"]["operational"]["route_destination"] = "render-projection"
-    corpus_stream.seek(0)
-    corpus_stream.truncate()
-    corpus_stream.write(yaml.safe_dump(corpus, sort_keys=False).encode("utf-8"))
-    corpus_stream.flush()
-    os.fsync(corpus_stream.fileno())
-    corpus_stream.close()
+    try:
+        try:
+            current_revision = repository_revision(repo)
+        except PromotionRejected as exc:
+            raise SystemExit("promotion repository changed before first governed output") from exc
+        if current_revision != frozen["repository_head_sha"]:
+            raise SystemExit("promotion repository changed before first governed output")
+        for path, obj in pending_writes:
+            write_new(repo, path, obj)
+        write_new(repo, repo / lane_summary_rel_path, lane_summary)
+        corpus_stream.seek(0)
+        corpus_stream.truncate()
+        corpus_stream.write(yaml.safe_dump(corpus, sort_keys=False).encode("utf-8"))
+        corpus_stream.flush()
+        os.fsync(corpus_stream.fileno())
+        # A current view is the publication pointer; install it only after every
+        # referenced receipt, node and corpus update has completed.
+        write_new(repo, repo / view_rel_path, current_view)
+    finally:
+        corpus_stream.close()
 
     print(view_id)
     print(f"promoted_nodes={len(node_ids)}")

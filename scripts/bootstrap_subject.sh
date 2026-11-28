@@ -22,9 +22,12 @@ from pathlib import Path
 from datetime import datetime, timezone
 import os
 import re
+import sys
 import yaml
 
 repo = Path(".").resolve()
+sys.path.insert(0, str(repo / "scripts"))
+from safe_pack_io import ensure_directory, read_bytes, write_new_bytes
 subject_slug = os.environ["SUBJECT_SLUG"].strip()
 subject_title = os.environ["SUBJECT_TITLE"].strip()
 intake_scope = os.environ["INTAKE_SCOPE"].strip()
@@ -43,9 +46,11 @@ if not subject_title:
 if not source_refs:
     raise SystemExit("At least one SOURCE_REF_* value is required")
 
-template_index = repo / "canon/corpora/example-subject/index.yaml"
-if not template_index.exists():
-    raise SystemExit(f"Missing template index: {template_index}")
+template_index = "canon/corpora/example-subject/index.yaml"
+try:
+    data = yaml.safe_load(read_bytes(repo, template_index, limit=2 * 1024 * 1024))
+except (OSError, ValueError) as exc:
+    raise SystemExit(f"Missing or unsafe template index: {exc}") from exc
 
 runtime_dirs = [
     f"canon/corpora/{subject_slug}",
@@ -59,27 +64,12 @@ runtime_dirs = [
     f"replay/manifests/{subject_slug}",
 ]
 
-def checked_directory(rel: str) -> Path:
-    path = repo / rel
-    cursor = repo
-    for part in Path(rel).parts:
-        cursor = cursor / part
-        if cursor.is_symlink():
-            raise SystemExit(f"Refusing symlinked bootstrap destination: {cursor}")
-    if not path.resolve(strict=False).is_relative_to(repo):
-        raise SystemExit(f"Bootstrap destination escapes repository: {path}")
-    return path
-
 for rel in runtime_dirs:
-    path = checked_directory(rel)
-    path.mkdir(parents=True, exist_ok=True)
+    ensure_directory(repo, rel)
     if not rel.startswith("canon/corpora/"):
-        (path / ".gitkeep").touch()
+        write_new_bytes(repo, rel + "/.gitkeep", b"")
 
-checked_directory("views/rendered").mkdir(parents=True, exist_ok=True)
-
-with template_index.open("r", encoding="utf-8") as fh:
-    data = yaml.safe_load(fh)
+ensure_directory(repo, "views/rendered")
 
 def walk(x):
     if isinstance(x, dict):
@@ -140,12 +130,9 @@ data["spec"]["source_count"] = len(source_refs)
 data["spec"]["intake_scope"] = intake_scope
 data["spec"]["status"] = "open"
 
-out = repo / f"canon/corpora/{subject_slug}/index.yaml"
-out.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
-
-(repo / f"views/rendered/{subject_slug}.md").write_text(
-    f"# {subject_title}\n\nPending first promotion.\n",
-    encoding="utf-8",
-)
+write_new_bytes(repo, f"canon/corpora/{subject_slug}/index.yaml",
+                yaml.safe_dump(data, sort_keys=False).encode("utf-8"))
+write_new_bytes(repo, f"views/rendered/{subject_slug}.md",
+                f"# {subject_title}\n\nPending first promotion.\n".encode("utf-8"))
 PY
 python3 scripts/validate_pack.py .

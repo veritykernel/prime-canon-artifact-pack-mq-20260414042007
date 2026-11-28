@@ -13,9 +13,10 @@ from pathlib import Path
 import yaml
 
 from schema_contract import choose_enum, ensure_required_fields, validate_instance
-from render_binding import compute_view_hash
+from render_binding import compute_view_hash, render_markdown
 from immutable_receipt import assert_new, write_new
-from validate_pack import load_yaml as load_bounded_yaml
+from safe_pack_io import read_bytes, replace_bytes
+from validate_pack import check_tree_bound
 
 PROFILE_KIND = "PRIME_CANON_RENDER_PROFILE_V1"
 PLAN_KIND = "PRIME_CANON_RENDER_PLAN_V1"
@@ -61,7 +62,7 @@ def check_rendered_destination(directory_fd: int, filename: str) -> None:
         raise SystemExit(f"unsafe rendered output destination: {filename} is not a regular file")
 
 
-def write_rendered_projection(repo: Path, subject_slug: str, rendered_text: str) -> str:
+def write_rendered_projection(repo: Path, subject_slug: str, rendered_bytes: bytes) -> str:
     filename = f"{subject_slug}.md"
     directory_fd = open_rendered_directory(repo)
     temporary_name = f".{filename}.{uuid.uuid4().hex}.tmp"
@@ -75,7 +76,7 @@ def write_rendered_projection(repo: Path, subject_slug: str, rendered_text: str)
         )
         try:
             with os.fdopen(fd, "wb") as stream:
-                stream.write(rendered_text.encode("utf-8"))
+                stream.write(rendered_bytes)
                 stream.flush()
                 os.fsync(stream.fileno())
             # A replacement symlink cannot redirect os.replace, but reject it anyway.
@@ -93,12 +94,13 @@ def write_rendered_projection(repo: Path, subject_slug: str, rendered_text: str)
                 pass
     finally:
         os.close(directory_fd)
-    return sha256_text(rendered_text)
+    return hashlib.sha256(rendered_bytes).hexdigest()
 
-def load_yaml(path: Path):
-    if not path.exists():
-        raise SystemExit(f"missing yaml: {path}")
-    return load_bounded_yaml(path)
+def load_yaml(repo: Path, path: Path):
+    raw = read_bytes(repo, path.relative_to(repo).as_posix(), limit=2 * 1024 * 1024)
+    obj = yaml.safe_load(raw)
+    check_tree_bound(obj)
+    return obj
 
 def main() -> None:
     repo = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(".").resolve()
@@ -143,12 +145,12 @@ def main() -> None:
     finally:
         os.close(rendered_fd)
 
-    corpus = load_yaml(corpus_index_path)
-    view = load_yaml(view_path)
-    profile_cfg = load_yaml(profile_cfg_path)
-    order_cfg = load_yaml(order_cfg_path)
-    targets_cfg = load_yaml(targets_cfg_path)
-    redaction_cfg = load_yaml(redaction_cfg_path)
+    corpus = load_yaml(repo, corpus_index_path)
+    view = load_yaml(repo, view_path)
+    profile_cfg = load_yaml(repo, profile_cfg_path)
+    order_cfg = load_yaml(repo, order_cfg_path)
+    targets_cfg = load_yaml(repo, targets_cfg_path)
+    redaction_cfg = load_yaml(repo, redaction_cfg_path)
 
     corpus_id = corpus["spec"]["corpus_id"]
     view_id = view["spec"]["view_id"]
@@ -357,7 +359,7 @@ def main() -> None:
         node_path = node_dir / f"node-{seq}.yaml"
         if not node_path.exists():
             raise SystemExit(f"missing node file for {node_id}: {node_path}")
-        node = load_yaml(node_path)
+        node = load_yaml(repo, node_path)
 
         flags = list(node["spec"].get("active_projection_flags", []))
         for item in default_projection_flags:
@@ -378,55 +380,23 @@ def main() -> None:
 
         ensure_required_fields(repo, NODE_KIND, node["spec"])
         validate_instance(repo, node)
-        node_path.write_text(yaml.safe_dump(node, sort_keys=False), encoding="utf-8")
+        replace_bytes(repo, node_path.relative_to(repo).as_posix(),
+                      yaml.safe_dump(node, sort_keys=False).encode("utf-8"))
 
         node_objects.append(node)
         all_source_refs.extend(node["attributes"]["lineage"].get("source_refs", []))
         all_source_unit_refs.extend(node["attributes"]["lineage"].get("source_unit_refs", []))
 
-    lines = []
-    title = f"{subject_slug} rendered canon"
-    if heading_style == "title_only":
-        lines.append(f"# {title}")
-    else:
-        lines.append(f"# {title}")
-    lines.append("")
+    corpus["metadata"]["updated_at"] = now
+    corpus["attributes"]["temporal"]["reduced_at"] = now
+    corpus["attributes"]["temporal"]["status_since"] = now
+    corpus["attributes"]["operational"]["route_destination"] = "export-prep"
+    replace_bytes(repo, corpus_index_path.relative_to(repo).as_posix(),
+                  yaml.safe_dump(corpus, sort_keys=False).encode("utf-8"))
 
-    metadata_map = {
-        "corpus_id": corpus_id,
-        "current_state_view": view_id,
-        "generated_at": now,
-    }
-
-    for field in include_metadata_fields:
-        if field in metadata_map:
-            lines.append(f"- {field}: `{metadata_map[field]}`")
-    lines.append(f"- active_node_count: `{len(node_objects)}`")
-    lines.append("")
-
-    lines.append("## Promoted canon nodes")
-    lines.append("")
-
-    if section_strategy != "linear_nodes":
-        raise SystemExit(f"unsupported section_strategy in first cycle-2 render refactor: {section_strategy}")
-    if ordering_strategy != "active_node_order":
-        raise SystemExit(f"unsupported ordering_strategy in first cycle-2 render refactor: {ordering_strategy}")
-
-    for idx, node in enumerate(node_objects, start=1):
-        if heading_style == "numbered":
-            lines.append(f"{idx}. {node['spec']['canonical_body']}")
-        else:
-            lines.append(f"- {node['spec']['canonical_body']}")
-
-    if include_receipt_footer:
-        lines.append("")
-        lines.append("## Projection receipts")
-        lines.append("")
-        lines.append(f"- render_profile_ref: `{render_profile['spec']['profile_id']}`")
-        lines.append(f"- render_plan_ref: `{plan_id}`")
-
-    rendered_text = "\n".join(lines) + "\n"
-    output_sha256 = write_rendered_projection(repo, subject_slug, rendered_text)
+    rendered_bytes = render_markdown(subject_slug, corpus_id, view_id, node_objects,
+                                     profile_cfg, plan_id, now)
+    output_sha256 = write_rendered_projection(repo, subject_slug, rendered_bytes)
 
     prior_receipts = list(view["spec"].get("derivation_receipt_refs", []))
 
@@ -520,8 +490,6 @@ def main() -> None:
 
     ensure_required_fields(repo, VIEW_KIND, view["spec"])
     validate_instance(repo, view)
-    view_path.write_text(yaml.safe_dump(view, sort_keys=False), encoding="utf-8")
-
     current_view_hash = view["spec"]["view_hash"]
 
     drift_receipt = {
@@ -603,12 +571,10 @@ def main() -> None:
 
     write_new(repo, execution_path, execution_receipt)
     write_new(repo, drift_path, drift_receipt)
-
-    corpus["metadata"]["updated_at"] = now
-    corpus["attributes"]["temporal"]["reduced_at"] = now
-    corpus["attributes"]["temporal"]["status_since"] = now
-    corpus["attributes"]["operational"]["route_destination"] = "export-prep"
-    corpus_index_path.write_text(yaml.safe_dump(corpus, sort_keys=False), encoding="utf-8")
+    # The current view is the final pointer; a failed append-only receipt write
+    # must leave it pointing to the previous generation.
+    replace_bytes(repo, view_path.relative_to(repo).as_posix(),
+                  yaml.safe_dump(view, sort_keys=False).encode("utf-8"))
 
     print(render_profile["spec"]["profile_id"])
     print(plan_id)

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+from safe_pack_io import ensure_directory, read_bytes, replace_bytes, write_new_bytes
 
 REQUIRED_COLUMNS = [
     "seq",
@@ -59,8 +60,7 @@ def main():
         raise SystemExit(f"Missing corpus index: {corpus_index_path}")
     rows = load_tsv(tsv_path)
 
-    with corpus_index_path.open("r", encoding="utf-8") as fh:
-        corpus = yaml.safe_load(fh)
+    corpus = yaml.safe_load(read_bytes(repo, f"canon/corpora/{subject_slug}/index.yaml", limit=2 * 1024 * 1024))
 
     corpus_id = corpus["spec"]["corpus_id"]
     now = utc_now()
@@ -71,8 +71,7 @@ def main():
     source_unit_ids = []
     source_refs = []
 
-    target_dir = repo / "canon" / "source_units" / subject_slug
-    target_dir.mkdir(parents=True, exist_ok=True)
+    ensure_directory(repo, f"canon/source_units/{subject_slug}")
 
     for row in rows:
         seq_num = int(row["seq"])
@@ -191,8 +190,7 @@ def main():
             },
         }
 
-        out_path = repo / rel_path
-        out_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+        write_new_bytes(repo, rel_path, yaml.safe_dump(data, sort_keys=False).encode("utf-8"))
 
     corpus["metadata"]["updated_at"] = now
     corpus["attributes"]["lineage"]["source_refs"] = source_refs
@@ -202,7 +200,8 @@ def main():
     corpus["attributes"]["temporal"]["status_since"] = now
     corpus["spec"]["source_refs"] = source_refs
     corpus["spec"]["source_count"] = len(source_refs)
-    corpus_index_path.write_text(yaml.safe_dump(corpus, sort_keys=False), encoding="utf-8")
+    replace_bytes(repo, f"canon/corpora/{subject_slug}/index.yaml",
+                  yaml.safe_dump(corpus, sort_keys=False).encode("utf-8"))
 
 if __name__ == "__main__":
     main()

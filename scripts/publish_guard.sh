@@ -4,25 +4,38 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export PYTHONDONTWRITEBYTECODE=1
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
-if [ ! -x .venv/bin/python3 ]; then
-  ./scripts/bootstrap_python.sh
+TRUSTED_PYTHON="${PRIME_CANON_TRUSTED_PYTHON:-}"
+if [ -z "$TRUSTED_PYTHON" ]; then
+  echo "PRIME_CANON_TRUSTED_PYTHON must name an operator-controlled interpreter outside this repository" >&2
+  exit 64
 fi
-source .venv/bin/activate
+/usr/bin/python3 scripts/verify_trusted_python.py "$REPO" "$TRUSTED_PYTHON"
 SUBJECT_SLUG="${SUBJECT_SLUG:-subject-0001}"
 if [ "${1:-}" = "--" ]; then
   shift
 fi
-if [ "$#" -eq 0 ]; then
-  echo "usage: SUBJECT_SLUG=subject-0001 ./scripts/publish_rendered_subject.sh subject-0001" >&2
+if ! { [ "$#" -eq 1 ] && { [ "$1" = publish ] || [ "$1" = /usr/bin/true ]; }; }; then
+  echo "publish guard accepts only publish or the no-effect /usr/bin/true check" >&2
   exit 64
 fi
-# The old arbitrary command mode allowed a green receipt to precede a copy
-# that reopened different bytes. Only the publisher that hashes and copies
-# one open snapshot is an admitted effect. /usr/bin/true is a dry-run check.
-if ! { [ "$#" -eq 4 ] && [ "$1" = python3 ] && [ "$2" = scripts/publish_verified_subject.py ] && [ "$3" = "$REPO" ] && [ "$4" = "$SUBJECT_SLUG" ]; } \
-   && ! { [ "$#" -eq 1 ] && [ "$1" = /usr/bin/true ]; }; then
-  echo "publish guard accepts only the verified subject publisher" >&2
-  exit 64
+# -I removes the candidate script directory from interpreter startup. Import
+# dependencies before appending frozen repository modules after site-packages.
+"$TRUSTED_PYTHON" -I -c '
+import sys
+import yaml, jsonschema
+sys.path.append(sys.argv[1] + "/scripts")
+from check_export_prep import main
+main()
+' "$REPO" "$SUBJECT_SLUG"
+if [ "$1" = /usr/bin/true ]; then
+  exit 0
 fi
-python3 scripts/check_export_prep.py "$REPO" "$SUBJECT_SLUG"
-exec "$@"
+exec "$TRUSTED_PYTHON" -I -c '
+import sys
+from pathlib import Path
+import yaml, jsonschema
+sys.path.append(sys.argv[1] + "/scripts")
+from publish_verified_subject import publish
+destination = publish(Path(sys.argv[1]), sys.argv[2])
+print(f"published_to={destination}")
+' "$REPO" "$SUBJECT_SLUG"

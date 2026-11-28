@@ -13,6 +13,7 @@ import yaml
 
 from schema_contract import choose_enum, ensure_required_fields, validate_instance
 from immutable_receipt import assert_new, write_new
+from safe_pack_io import ensure_directory, read_bytes, replace_bytes
 
 CONTRADICTION_KIND = "PRIME_CANON_CONTRADICTION_BUNDLE_V1"
 SUPERSESSION_KIND = "PRIME_CANON_SUPERSESSION_EDGE_V1"
@@ -20,17 +21,18 @@ RECEIPT_KIND = "PRIME_CANON_REDUCTION_DECISION_RECEIPT_V1"
 MAX_CLAIMS = 512
 MAX_TEXT = 8192
 MAX_YAML_BYTES = 2 * 1024 * 1024
+MAX_TOTAL_INPUT_BYTES = 64 * 1024 * 1024
+MAX_PAIR_EVALUATIONS = 16384
 
 
-def read_yaml(path: Path) -> dict:
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    with os.fdopen(fd, "rb") as stream:
-        info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_YAML_BYTES:
-            raise SystemExit(f"scout input is not a bounded regular file: {path}")
-        raw = stream.read(MAX_YAML_BYTES + 1)
-    if len(raw) > MAX_YAML_BYTES:
-        raise SystemExit(f"scout input exceeds size limit: {path}")
+def read_yaml(repo: Path, path: Path, budget: list[int]) -> dict:
+    try:
+        raw = read_bytes(repo, path.relative_to(repo).as_posix(), limit=MAX_YAML_BYTES)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"scout input is not a bounded regular file: {path}: {exc}") from exc
+    budget[0] += len(raw)
+    if budget[0] > MAX_TOTAL_INPUT_BYTES:
+        raise SystemExit("topology scout input exceeds aggregate byte budget")
     return yaml.safe_load(raw)
 
 def utc_now() -> str:
@@ -58,6 +60,28 @@ def claim_scope_key(claim: dict) -> str:
 
 def claim_claim_type(claim: dict) -> str:
     return str(claim["spec"].get("claim_type", "")).strip().lower()
+
+
+def candidate_pairs(claims: list[dict], token_sets: list[set[str]]) -> list[tuple[int, int]]:
+    """Only claims sharing a token or scope can meet a scout relation."""
+    tokens_to_indices: dict[str, list[int]] = {}
+    scopes_to_indices: dict[str, list[int]] = {}
+    pairs: set[tuple[int, int]] = set()
+
+    def include_prior(prior: list[int], current: int) -> None:
+        for earlier in prior:
+            pairs.add((earlier, current))
+            if len(pairs) > MAX_PAIR_EVALUATIONS:
+                raise ValueError(f"topology candidate pairs exceed {MAX_PAIR_EVALUATIONS}; split or review the batch")
+
+    for index, claim in enumerate(claims):
+        scope = claim_scope_key(claim)
+        include_prior(scopes_to_indices.setdefault(scope, []), index)
+        scopes_to_indices[scope].append(index)
+        for token in token_sets[index]:
+            include_prior(tokens_to_indices.setdefault(token, []), index)
+            tokens_to_indices[token].append(index)
+    return sorted(pairs)
 
 def build_contradiction(repo: Path, subject_slug: str, corpus_id: str, now: str, seq: int, left: dict, right: dict, source_refs: list[str], source_unit_refs: list[str]) -> dict:
     contradiction_id = f"pc.contradiction_bundle.{subject_slug}.{seq:04d}"
@@ -318,9 +342,8 @@ def main() -> None:
     if not corpus_index_path.exists():
         raise SystemExit(f"missing corpus index: {corpus_index_path}")
 
-    contradiction_dir.mkdir(parents=True, exist_ok=True)
-    supersession_dir.mkdir(parents=True, exist_ok=True)
-    receipt_dir.mkdir(parents=True, exist_ok=True)
+    for directory in (contradiction_dir, supersession_dir, receipt_dir):
+        ensure_directory(repo, directory.relative_to(repo).as_posix())
     summary_path = receipt_dir / "topology-scout-summary.yaml"
     assert_new(repo, summary_path)
 
@@ -334,21 +357,22 @@ def main() -> None:
     if len(claim_files) > MAX_CLAIMS or len(admiss_files) > MAX_CLAIMS:
         raise SystemExit(f"topology scout is limited to {MAX_CLAIMS} claims and decisions per run")
 
-    corpus = read_yaml(corpus_index_path)
+    budget = [0]
+    corpus = read_yaml(repo, corpus_index_path, budget)
     corpus_id = corpus["spec"]["corpus_id"]
     now = utc_now()
 
     admissibility_by_claim = {}
     cited_receipt_refs = []
     for path in admiss_files:
-        decision = read_yaml(path)
+        decision = read_yaml(repo, path, budget)
         claim_ref = decision["spec"]["target_claim_ref"]
         admissibility_by_claim[claim_ref] = decision
         cited_receipt_refs.append(decision["metadata"]["object_id"])
 
     claims = []
     for path in claim_files:
-        claim = read_yaml(path)
+        claim = read_yaml(repo, path, budget)
         if admissibility_passed(admissibility_by_claim.get(claim["spec"]["claim_id"], {})):
             claims.append(claim)
 
@@ -356,65 +380,62 @@ def main() -> None:
     supersession_refs = []
     contradiction_seq = 1
     supersession_seq = 1
-    seen_pairs = set()
-    claim_texts = []
     claim_tokens = []
     claim_negations = []
     claim_norms = []
+    claim_ids = [claim["spec"]["claim_id"] for claim in claims]
+    if len(set(claim_ids)) != len(claim_ids):
+        raise SystemExit("duplicate candidate claim ID in topology scout input")
     for claim in claims:
         body = claim["spec"]["normalized_claim_body"]
         if not isinstance(body, str) or len(body) > MAX_TEXT:
             raise SystemExit(f"claim body exceeds {MAX_TEXT} characters")
-        claim_texts.append(body)
         claim_tokens.append(tokens(body))
         claim_negations.append(has_negation(body))
         claim_norms.append(norm(body))
 
-    for i in range(len(claims)):
+    try:
+        pairs = candidate_pairs(claims, claim_tokens)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    for i, j in pairs:
         left = claims[i]
-        left_text = claim_texts[i]
         left_type = claim_claim_type(left)
-        for j in range(i + 1, len(claims)):
-            right = claims[j]
-            right_text = claim_texts[j]
-            right_type = claim_claim_type(right)
-            pair_key = tuple(sorted([left["spec"]["claim_id"], right["spec"]["claim_id"]]))
-            if pair_key in seen_pairs:
+        right = claims[j]
+        right_type = claim_claim_type(right)
+        overlap = jaccard(claim_tokens[i], claim_tokens[j])
+        source_refs = sorted(set(left["attributes"]["lineage"].get("source_refs", []) + right["attributes"]["lineage"].get("source_refs", [])))
+        source_unit_refs = sorted(set(left["attributes"]["lineage"].get("source_unit_refs", []) + right["attributes"]["lineage"].get("source_unit_refs", [])))
+
+        if overlap >= 0.60 and claim_negations[i] != claim_negations[j]:
+            contradiction = build_contradiction(repo, subject_slug, corpus_id, now, contradiction_seq, left, right, source_refs, source_unit_refs)
+            out = repo / contradiction["attributes"]["identity"]["canonical_home"]
+            write_new(repo, out, contradiction)
+            contradiction_refs.append(contradiction["metadata"]["object_id"])
+            contradiction_seq += 1
+            continue
+
+        same_scope = claim_scope_key(left) == claim_scope_key(right)
+        neither_question = left_type != "question" and right_type != "question"
+        left_norm = claim_norms[i]
+        right_norm = claim_norms[j]
+
+        if same_scope and neither_question:
+            if left_norm != right_norm and left_norm in right_norm and len(right_norm) - len(left_norm) >= 24:
+                edge = build_supersession(repo, subject_slug, corpus_id, now, supersession_seq, left, right, source_refs, source_unit_refs, "successor claim strictly contains prior claim text and adds more specific scope")
+                out = repo / edge["attributes"]["identity"]["canonical_home"]
+                write_new(repo, out, edge)
+                supersession_refs.append(edge["metadata"]["object_id"])
+                supersession_seq += 1
                 continue
-            seen_pairs.add(pair_key)
-
-            overlap = jaccard(claim_tokens[i], claim_tokens[j])
-            source_refs = sorted(set(left["attributes"]["lineage"].get("source_refs", []) + right["attributes"]["lineage"].get("source_refs", [])))
-            source_unit_refs = sorted(set(left["attributes"]["lineage"].get("source_unit_refs", []) + right["attributes"]["lineage"].get("source_unit_refs", [])))
-
-            if overlap >= 0.60 and claim_negations[i] != claim_negations[j]:
-                contradiction = build_contradiction(repo, subject_slug, corpus_id, now, contradiction_seq, left, right, source_refs, source_unit_refs)
-                out = repo / contradiction["attributes"]["identity"]["canonical_home"]
-                write_new(repo, out, contradiction)
-                contradiction_refs.append(contradiction["metadata"]["object_id"])
-                contradiction_seq += 1
+            if left_norm != right_norm and right_norm in left_norm and len(left_norm) - len(right_norm) >= 24:
+                edge = build_supersession(repo, subject_slug, corpus_id, now, supersession_seq, right, left, source_refs, source_unit_refs, "successor claim strictly contains prior claim text and adds more specific scope")
+                out = repo / edge["attributes"]["identity"]["canonical_home"]
+                write_new(repo, out, edge)
+                supersession_refs.append(edge["metadata"]["object_id"])
+                supersession_seq += 1
                 continue
-
-            same_scope = claim_scope_key(left) == claim_scope_key(right)
-            neither_question = left_type != "question" and right_type != "question"
-            left_norm = claim_norms[i]
-            right_norm = claim_norms[j]
-
-            if same_scope and neither_question:
-                if left_norm != right_norm and left_norm in right_norm and len(right_norm) - len(left_norm) >= 24:
-                    edge = build_supersession(repo, subject_slug, corpus_id, now, supersession_seq, left, right, source_refs, source_unit_refs, "successor claim strictly contains prior claim text and adds more specific scope")
-                    out = repo / edge["attributes"]["identity"]["canonical_home"]
-                    write_new(repo, out, edge)
-                    supersession_refs.append(edge["metadata"]["object_id"])
-                    supersession_seq += 1
-                    continue
-                if left_norm != right_norm and right_norm in left_norm and len(left_norm) - len(right_norm) >= 24:
-                    edge = build_supersession(repo, subject_slug, corpus_id, now, supersession_seq, right, left, source_refs, source_unit_refs, "successor claim strictly contains prior claim text and adds more specific scope")
-                    out = repo / edge["attributes"]["identity"]["canonical_home"]
-                    write_new(repo, out, edge)
-                    supersession_refs.append(edge["metadata"]["object_id"])
-                    supersession_seq += 1
-                    continue
 
     cited_object_refs = [c["spec"]["claim_id"] for c in claims] + contradiction_refs + supersession_refs
 
@@ -436,7 +457,8 @@ def main() -> None:
     corpus["attributes"]["temporal"]["reduced_at"] = now
     corpus["attributes"]["temporal"]["status_since"] = now
     corpus["attributes"]["operational"]["route_destination"] = route_destination
-    corpus_index_path.write_text(yaml.safe_dump(corpus, sort_keys=False), encoding="utf-8")
+    replace_bytes(repo, f"canon/corpora/{subject_slug}/index.yaml",
+                  yaml.safe_dump(corpus, sort_keys=False).encode("utf-8"))
 
     print(f"generated {len(contradiction_refs)} contradiction bundles for {subject_slug}")
     for ref in contradiction_refs:

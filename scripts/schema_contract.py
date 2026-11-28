@@ -7,16 +7,21 @@ from pathlib import Path
 from typing import Any
 
 from jsonschema import Draft202012Validator
+from safe_pack_io import read_bytes
+
+SCHEMA_RELATIVE = "schemas/prime-canon-bundle.schema.json"
+MAX_SCHEMA_BYTES = 2 * 1024 * 1024
 
 @lru_cache(maxsize=None)
-def _load_bundle(bundle_path_str: str) -> dict[str, Any]:
-    return json.loads(Path(bundle_path_str).read_text(encoding="utf-8"))
+def _load_bundle(repo_path_str: str) -> dict[str, Any]:
+    return json.loads(read_bytes(Path(repo_path_str), SCHEMA_RELATIVE,
+                                 limit=MAX_SCHEMA_BYTES).decode("utf-8"))
 
 def bundle_path(repo_root: Path) -> Path:
-    return (repo_root / "schemas" / "prime-canon-bundle.schema.json").resolve()
+    return repo_root / SCHEMA_RELATIVE
 
 def bundle(repo_root: Path) -> dict[str, Any]:
-    return _load_bundle(str(bundle_path(repo_root)))
+    return _load_bundle(str(repo_root.resolve(strict=True)))
 
 def object_schema(repo_root: Path, kind: str) -> dict[str, Any]:
     defs = bundle(repo_root).get("$defs", {})

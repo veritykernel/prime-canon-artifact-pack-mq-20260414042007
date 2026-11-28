@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+from object_identity import index_repo
+from safe_pack_io import ensure_directory, read_bytes, replace_bytes, write_new_bytes
 
 from schema_contract import choose_enum, ensure_required_fields, validate_instance
 from promotion_preflight import SUBJECT
@@ -19,15 +21,15 @@ RECEIPT_KIND = "PRIME_CANON_REDUCTION_DECISION_RECEIPT_V1"
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def sha256_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def load_yaml(repo: Path, path: Path) -> dict:
+    return yaml.safe_load(read_bytes(repo, path.relative_to(repo).as_posix(), limit=2 * 1024 * 1024))
+
+def sha256_file(repo: Path, path: Path) -> str:
+    return hashlib.sha256(read_bytes(repo, path.relative_to(repo).as_posix(), limit=2 * 1024 * 1024)).hexdigest()
 
 def write_new(repo: Path, path: Path, obj: dict) -> None:
-    if not path.parent.resolve().is_relative_to(repo):
-        raise SystemExit(f"output path escapes repository: {path}")
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
-    with os.fdopen(fd, "w", encoding="utf-8") as stream:
-        stream.write(yaml.safe_dump(obj, sort_keys=False))
+    write_new_bytes(repo, path.relative_to(repo).as_posix(),
+                    yaml.safe_dump(obj, sort_keys=False).encode("utf-8"), create_parents=True)
 
 def blast_radius_for(repo: Path, target_count: int) -> str:
     if target_count <= 5:
@@ -43,6 +45,10 @@ def blast_radius_for(repo: Path, target_count: int) -> str:
 def main() -> None:
     repo = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(".").resolve()
     subject_slug = sys.argv[2] if len(sys.argv) > 2 else "subject-0001"
+    try:
+        index_repo(repo)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        raise SystemExit(f"repository object identity rejected: {exc}") from exc
     if not SUBJECT.fullmatch(subject_slug):
         raise SystemExit("invalid subject slug")
 
@@ -70,7 +76,7 @@ def main() -> None:
                receipt_dir / "promotion-readiness-summary.yaml")
     if any(path.exists() or path.is_symlink() for path in outputs):
         raise SystemExit("readiness outputs already exist; reconcile the prior effect before retrying")
-    replay_dir.mkdir(parents=True, exist_ok=True)
+    ensure_directory(repo, replay_dir.relative_to(repo).as_posix())
 
     claim_files = sorted(p for p in claim_dir.glob("claim-*.yaml") if p.is_file())
     evidence_files = sorted(p for p in evidence_dir.glob("link-*.yaml") if p.is_file())
@@ -89,7 +95,7 @@ def main() -> None:
     if not topology_receipt_path.exists():
         raise SystemExit(f"missing topology summary receipt: {topology_receipt_path}")
 
-    corpus = yaml.safe_load(corpus_index_path.read_text(encoding="utf-8"))
+    corpus = load_yaml(repo, corpus_index_path)
     corpus_id = corpus["spec"]["corpus_id"]
     now = utc_now()
 
@@ -98,7 +104,7 @@ def main() -> None:
     admissibility_paths_by_id = {}
 
     for path in admissibility_files:
-        decision = yaml.safe_load(path.read_text(encoding="utf-8"))
+        decision = load_yaml(repo, path)
         claim_ref = decision["spec"]["target_claim_ref"]
         decision_id = decision["metadata"]["object_id"]
         if claim_ref in admissibility_by_claim or decision_id in admissibility_paths_by_id:
@@ -111,7 +117,7 @@ def main() -> None:
     target_claim_ids = []
     claim_paths_by_id = {}
     for path in claim_files:
-        claim = yaml.safe_load(path.read_text(encoding="utf-8"))
+        claim = load_yaml(repo, path)
         claim_id = claim["spec"]["claim_id"]
         if claim_id in claim_paths_by_id:
             raise SystemExit(f"duplicate claim id: {claim_id}")
@@ -124,7 +130,7 @@ def main() -> None:
     formula_paths_by_id = {}
     formula_by_target = {}
     for path in formula_files:
-        formula = yaml.safe_load(path.read_text(encoding="utf-8"))
+        formula = load_yaml(repo, path)
         formula_id = formula["metadata"]["object_id"]
         target_ref = formula["spec"]["target_ref"]
         if formula_id in formula_paths_by_id or target_ref in formula_by_target:
@@ -135,7 +141,7 @@ def main() -> None:
     evidence_link_ids = []
     evidence_paths_by_id = {}
     for path in evidence_files:
-        link = yaml.safe_load(path.read_text(encoding="utf-8"))
+        link = load_yaml(repo, path)
         link_id = link["metadata"]["object_id"]
         if link_id in evidence_paths_by_id:
             raise SystemExit(f"duplicate evidence link id: {link_id}")
@@ -144,15 +150,15 @@ def main() -> None:
 
     contradiction_ids = []
     for path in contradiction_files:
-        obj = yaml.safe_load(path.read_text(encoding="utf-8"))
+        obj = load_yaml(repo, path)
         contradiction_ids.append(obj["metadata"]["object_id"])
 
     supersession_ids = []
     for path in supersession_files:
-        obj = yaml.safe_load(path.read_text(encoding="utf-8"))
+        obj = load_yaml(repo, path)
         supersession_ids.append(obj["metadata"]["object_id"])
 
-    topology_receipt = yaml.safe_load(topology_receipt_path.read_text(encoding="utf-8"))
+    topology_receipt = load_yaml(repo, topology_receipt_path)
     topology_receipt_id = topology_receipt["metadata"]["object_id"]
     topology_blocker_state = topology_receipt["spec"]["blocker_state"]
 
@@ -228,7 +234,7 @@ def main() -> None:
     for object_ref in sorted(object_ref_paths):
         input_hashes.append({
             "object_ref": object_ref,
-            "sha256": sha256_file(object_ref_paths[object_ref]),
+            "sha256": sha256_file(repo, object_ref_paths[object_ref]),
         })
 
     replay_manifest = {
@@ -518,7 +524,8 @@ def main() -> None:
     corpus["attributes"]["temporal"]["reduced_at"] = now
     corpus["attributes"]["temporal"]["status_since"] = now
     corpus["attributes"]["operational"]["route_destination"] = "promotion_lane" if ready else "deferred"
-    corpus_index_path.write_text(yaml.safe_dump(corpus, sort_keys=False), encoding="utf-8")
+    replace_bytes(repo, f"canon/corpora/{subject_slug}/index.yaml",
+                  yaml.safe_dump(corpus, sort_keys=False).encode("utf-8"))
 
     print(manifest_id)
     print(packet_id)

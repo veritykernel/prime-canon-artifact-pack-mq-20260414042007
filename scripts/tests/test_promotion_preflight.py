@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -16,9 +17,11 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from promotion_preflight import PromotionRejected, preflight
 import promote_nodes_and_current_state
+import safe_pack_io
 from publish_verified_subject import publish
 from render_binding import compute_view_hash
 from check_render_drift import inspect
+from render_receipts import active_receipt_paths
 
 
 SOURCE = Path(__file__).resolve().parents[2]
@@ -29,7 +32,7 @@ class PromotionPreflightTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.repo = self.root / "repo"
         for directory in ("canon", "receipts", "replay", "schemas", "control"):
             shutil.copytree(SOURCE / directory, self.repo / directory)
@@ -42,6 +45,15 @@ class PromotionPreflightTests(unittest.TestCase):
         self.sign()
 
     def sign(self):
+        if not (self.repo / ".git").exists():
+            subprocess.run(["/usr/bin/git", "init", "-q", str(self.repo)], check=True)
+            subprocess.run(["/usr/bin/git", "config", "user.name", "Fixture reviewer"], cwd=self.repo, check=True)
+            subprocess.run(["/usr/bin/git", "config", "user.email", "reviewer@example.invalid"], cwd=self.repo, check=True)
+        subprocess.run(["/usr/bin/git", "add", "-A"], cwd=self.repo, check=True)
+        if subprocess.run(["/usr/bin/git", "diff", "--cached", "--quiet"], cwd=self.repo).returncode:
+            subprocess.run(["/usr/bin/git", "commit", "-qm", "Seal promotion fixture revision"],
+                           cwd=self.repo, check=True)
+        head = subprocess.check_output(["/usr/bin/git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
         receipt = self.repo / "receipts" / "immutable" / SUBJECT
         paths = {
             "packet_sha256": receipt / "promotion-readiness-packet.yaml",
@@ -54,6 +66,7 @@ class PromotionPreflightTests(unittest.TestCase):
         now = datetime.now(timezone.utc)
         body = {
             "kind": "PRIME_CANON_PROMOTION_APPROVAL_V1",
+            "repository_head_sha": head,
             "subject_slug": SUBJECT,
             "corpus_id": f"pc.corpus.{SUBJECT}",
             "corpus_sha256": hashlib.sha256((self.repo / "canon" / "corpora" / SUBJECT / "index.yaml").read_bytes()).hexdigest(),
@@ -131,6 +144,7 @@ class PromotionPreflightTests(unittest.TestCase):
         (receipt_dir / "promotion-lane-summary.yaml").unlink()
         for path in (self.repo / "canon" / "nodes" / SUBJECT).glob("node-*.yaml"):
             path.unlink()
+        self.sign()
         verified = self.check()
         with patch.object(promote_nodes_and_current_state, "preflight", return_value=verified), \
              patch.object(sys, "argv", ["promote", str(self.repo), SUBJECT]):
@@ -139,6 +153,77 @@ class PromotionPreflightTests(unittest.TestCase):
         self.assertEqual(summary["spec"]["reviewer_refs"], ["human:reviewer"])
         self.assertIn(verified["approval_sha256"], summary["spec"]["rationale"])
         self.assertTrue((self.repo / "views" / "current" / f"{SUBJECT}.yaml").exists())
+
+    def test_promotion_rechecks_exact_revision_after_preflight(self):
+        self.make_policy_ready()
+        receipt_dir = self.repo / "receipts" / "immutable" / SUBJECT
+        for path in receipt_dir.glob("promotion-node-*.yaml"):
+            path.unlink()
+        (receipt_dir / "promotion-lane-summary.yaml").unlink()
+        for path in (self.repo / "canon" / "nodes" / SUBJECT).glob("node-*.yaml"):
+            path.unlink()
+        self.sign()
+        verified = self.check()
+        (self.repo / "README.md").write_text("later unrelated committed revision\n")
+        subprocess.run(["/usr/bin/git", "add", "README.md"], cwd=self.repo, check=True)
+        subprocess.run(["/usr/bin/git", "commit", "-qm", "later revision"], cwd=self.repo, check=True)
+        with patch.object(promote_nodes_and_current_state, "preflight", return_value=verified), \
+             patch.object(sys, "argv", ["promote", str(self.repo), SUBJECT]), \
+             self.assertRaisesRegex(SystemExit, "changed after signed preflight"):
+            promote_nodes_and_current_state.main()
+        self.assertFalse((self.repo / "canon" / "nodes" / SUBJECT / "node-0001.yaml").exists())
+
+    def test_promotion_rechecks_revision_after_build_before_first_output(self):
+        self.make_policy_ready()
+        receipt_dir = self.repo / "receipts" / "immutable" / SUBJECT
+        for path in receipt_dir.glob("promotion-node-*.yaml"):
+            path.unlink()
+        (receipt_dir / "promotion-lane-summary.yaml").unlink()
+        for path in (self.repo / "canon" / "nodes" / SUBJECT).glob("node-*.yaml"):
+            path.unlink()
+        self.sign()
+        verified = self.check()
+        original_validate = promote_nodes_and_current_state.validate_instance
+        changed = [False]
+
+        def change_revision_during_build(repo, obj):
+            if not changed[0]:
+                (repo / "README.md").write_text("committed after signed preflight\n")
+                subprocess.run(["/usr/bin/git", "add", "README.md"], cwd=repo, check=True)
+                subprocess.run(["/usr/bin/git", "commit", "-qm", "concurrent revision"], cwd=repo, check=True)
+                changed[0] = True
+            return original_validate(repo, obj)
+
+        with patch.object(promote_nodes_and_current_state, "preflight", return_value=verified), \
+             patch.object(promote_nodes_and_current_state, "validate_instance",
+                          side_effect=change_revision_during_build), \
+             patch.object(sys, "argv", ["promote", str(self.repo), SUBJECT]), \
+             self.assertRaisesRegex(SystemExit, "changed before first governed output"):
+            promote_nodes_and_current_state.main()
+        self.assertTrue(changed[0])
+        self.assertFalse((receipt_dir / "promotion-node-0001.yaml").exists())
+        self.assertFalse((self.repo / "views" / "current" / f"{SUBJECT}.yaml").exists())
+
+    def test_promotion_output_parent_swap_cannot_escape_repo(self):
+        repo = self.root / "write-repo"
+        target_dir = repo / "canon" / "nodes" / SUBJECT
+        target_dir.mkdir(parents=True)
+        outside = self.root / "outside"
+        outside.mkdir()
+        original_open = safe_pack_io.os.open
+        swapped = [False]
+
+        def race_open(*args, **kwargs):
+            if args[0] == SUBJECT and kwargs.get("dir_fd") is not None and not swapped[0]:
+                target_dir.rename(repo / "canon" / "nodes" / "parked")
+                target_dir.symlink_to(outside, target_is_directory=True)
+                swapped[0] = True
+            return original_open(*args, **kwargs)
+
+        with patch.object(safe_pack_io.os, "open", side_effect=race_open), self.assertRaises(OSError):
+            promote_nodes_and_current_state.write_new(repo, target_dir / "node-9999.yaml", {"test": True})
+        self.assertTrue(swapped[0])
+        self.assertFalse((outside / "node-9999.yaml").exists())
 
     def test_changed_claim_fails_before_promotion(self):
         claim = self.repo / "canon" / "candidate_claims" / SUBJECT / "claim-0001.yaml"
@@ -151,6 +236,38 @@ class PromotionPreflightTests(unittest.TestCase):
         body["expires_at"] = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
         self.approval.write_text(json.dumps(body, sort_keys=True))
         with self.assertRaisesRegex(PromotionRejected, "signature verification failed"):
+            self.check()
+
+    def test_path_shadow_cannot_approve_corrupt_signature(self):
+        self.make_policy_ready()
+        self.sign()
+        (self.root / "approval.json.sig").write_bytes(b"forged signature")
+        shadow = self.root / "bin"
+        shadow.mkdir()
+        fake = shadow / "ssh-keygen"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(0o755)
+        with patch.dict(os.environ, {"PATH": f"{shadow}:/usr/bin:/bin"}):
+            with self.assertRaisesRegex(PromotionRejected, "signature verification failed"):
+                self.check()
+
+    def test_signer_symlink_cannot_replace_snapshot(self):
+        self.make_policy_ready()
+        self.sign()
+        linked = self.root / "linked_signers"
+        linked.symlink_to(self.signers)
+        with self.assertRaises(PromotionRejected):
+            preflight(self.repo, SUBJECT, approval_path=self.approval,
+                      signature_path=self.root / "approval.json.sig",
+                      signers_path=linked, root_owned=False)
+
+    def test_signed_approval_cannot_replay_after_clean_revision_change(self):
+        self.make_policy_ready()
+        self.sign()
+        (self.repo / "README.md").write_text("unrelated committed source revision\n")
+        subprocess.run(["/usr/bin/git", "add", "README.md"], cwd=self.repo, check=True)
+        subprocess.run(["/usr/bin/git", "commit", "-qm", "later revision"], cwd=self.repo, check=True)
+        with self.assertRaisesRegex(PromotionRejected, "exact promotion inputs and targets"):
             self.check()
 
     def test_no_approval_fails_closed(self):
@@ -189,7 +306,7 @@ class PromotionPreflightTests(unittest.TestCase):
         result = subprocess.run([sys.executable, str(SOURCE / "scripts" / "build_promotion_readiness.py"),
                                  str(self.repo), SUBJECT], capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("duplicate claim id", result.stderr)
+        self.assertIn("candidate claim identity", result.stderr)
         self.assertFalse(manifest_path.exists())
 
     def test_contributor_labels_cannot_create_passing_admissibility(self):
@@ -222,6 +339,7 @@ class VerifiedPublicationTests(unittest.TestCase):
             shutil.copytree(SOURCE / directory, self.repo / directory)
         (self.repo / "canon").mkdir()
         shutil.copytree(SOURCE / "canon" / "nodes", self.repo / "canon" / "nodes")
+        shutil.copytree(SOURCE / "canon" / "corpora", self.repo / "canon" / "corpora")
         view_path = self.repo / "views" / "current" / f"{SUBJECT}.yaml"
         drift_path = self.repo / "receipts" / "immutable" / SUBJECT / "render-drift.yaml"
         view = yaml.safe_load(view_path.read_text())
@@ -231,7 +349,7 @@ class VerifiedPublicationTests(unittest.TestCase):
         drift["spec"]["current_view_hash"] = current_hash
         view_path.write_text(yaml.safe_dump(view, sort_keys=False))
         drift_path.write_text(yaml.safe_dump(drift, sort_keys=False))
-        self.stage = self.root / "stage"
+        self.stage = (self.root / "stage").resolve()
         self.stage.mkdir()
         self.target = self.stage / f"{SUBJECT}.rendered.md"
         cfg_path = self.repo / "control" / "publish" / "publish-targets.default.yaml"
@@ -240,7 +358,7 @@ class VerifiedPublicationTests(unittest.TestCase):
         cfg_path.write_text(yaml.safe_dump(cfg))
 
     def test_publishes_the_verified_bytes(self):
-        self.assertEqual(publish(self.repo, SUBJECT), self.target)
+        self.assertEqual(publish(self.repo, SUBJECT, stage_root=self.stage), self.target)
         self.assertEqual(self.target.read_bytes(), (self.repo / "views" / "rendered" / f"{SUBJECT}.md").read_bytes())
 
     def test_changed_render_cannot_replace_existing_publication(self):
@@ -248,15 +366,43 @@ class VerifiedPublicationTests(unittest.TestCase):
         source = self.repo / "views" / "rendered" / f"{SUBJECT}.md"
         source.write_text(source.read_text() + "\nchanged after drift check\n")
         with self.assertRaisesRegex(PromotionRejected, "rendered source bytes differ"):
-            publish(self.repo, SUBJECT)
+            publish(self.repo, SUBJECT, stage_root=self.stage)
         self.assertEqual(self.target.read_text(), "prior publication")
+
+    def test_forged_body_and_matching_receipt_hashes_still_fail(self):
+        source = self.repo / "views" / "rendered" / f"{SUBJECT}.md"
+        source.write_text("# Forged body unrelated to governed canon\n")
+        forged_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        view = yaml.safe_load((self.repo / "views" / "current" / f"{SUBJECT}.yaml").read_text())
+        for receipt_path in active_receipt_paths(self.repo, SUBJECT, view):
+            receipt = yaml.safe_load(receipt_path.read_text())
+            receipt["spec"]["output_sha256"] = forged_hash
+            receipt_path.write_text(yaml.safe_dump(receipt, sort_keys=False))
+        self.assertEqual(inspect(self.repo, SUBJECT)[1], "out_of_sync")
+        with self.assertRaisesRegex(PromotionRejected, "governed source"):
+            publish(self.repo, SUBJECT, stage_root=self.stage)
+        self.assertFalse(self.target.exists())
+
+    def test_target_config_cannot_redirect_publication(self):
+        cfg_path = self.repo / "control" / "publish" / "publish-targets.default.yaml"
+        cfg = yaml.safe_load(cfg_path.read_text())
+        cfg["subjects"][SUBJECT]["rendered_markdown_path"] = str(self.root / "wrong" / "output.md")
+        cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+        with self.assertRaisesRegex(PromotionRejected, "trusted stage destination"):
+            publish(self.repo, SUBJECT, stage_root=self.stage)
+
+    def test_group_writable_stage_is_held(self):
+        self.stage.chmod(0o775)
+        with self.assertRaisesRegex(PromotionRejected, "unsafe owner or permissions"):
+            publish(self.repo, SUBJECT, stage_root=self.stage)
+        self.assertFalse(self.target.exists())
 
     def test_symlink_target_cannot_overwrite_operator_file(self):
         protected = self.root / "operator-file"
         protected.write_text("keep")
         self.target.symlink_to(protected)
-        with self.assertRaisesRegex(PromotionRejected, "target is a symlink"):
-            publish(self.repo, SUBJECT)
+        with self.assertRaisesRegex(PromotionRejected, "target is not a regular file"):
+            publish(self.repo, SUBJECT, stage_root=self.stage)
         self.assertEqual(protected.read_text(), "keep")
 
     def test_changed_node_or_render_policy_blocks_publication(self):
@@ -264,13 +410,19 @@ class VerifiedPublicationTests(unittest.TestCase):
         node.write_text(node.read_text() + "\n# post-receipt edit\n")
         self.assertEqual(inspect(self.repo, SUBJECT)[1], "stale_view")
         with self.assertRaisesRegex(PromotionRejected, "render receipts and current view"):
-            publish(self.repo, SUBJECT)
+            publish(self.repo, SUBJECT, stage_root=self.stage)
         node.write_bytes((SOURCE / "canon" / "nodes" / SUBJECT / "node-0001.yaml").read_bytes())
         policy = self.repo / "control" / "render" / "render-order.default.yaml"
         policy.write_text(policy.read_text() + "\n# post-receipt edit\n")
         self.assertEqual(inspect(self.repo, SUBJECT)[1], "stale_view")
         with self.assertRaisesRegex(PromotionRejected, "render receipts and current view"):
-            publish(self.repo, SUBJECT)
+            publish(self.repo, SUBJECT, stage_root=self.stage)
+        policy.write_bytes((SOURCE / "control" / "render" / "render-order.default.yaml").read_bytes())
+        corpus = self.repo / "canon" / "corpora" / SUBJECT / "index.yaml"
+        corpus.write_text(corpus.read_text() + "\n# changed corpus after receipt\n")
+        self.assertEqual(inspect(self.repo, SUBJECT)[1], "stale_view")
+        with self.assertRaisesRegex(PromotionRejected, "render receipts and current view"):
+            publish(self.repo, SUBJECT, stage_root=self.stage)
 
 
 if __name__ == "__main__":
