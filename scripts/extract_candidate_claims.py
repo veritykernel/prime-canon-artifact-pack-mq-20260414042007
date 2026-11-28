@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+from safe_pack_io import ensure_directory, read_bytes, replace_bytes, write_new_bytes
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -66,7 +67,7 @@ def main() -> None:
     if not corpus_index_path.exists():
         raise SystemExit(f"missing corpus index: {corpus_index_path}")
 
-    claim_dir.mkdir(parents=True, exist_ok=True)
+    ensure_directory(repo, f"canon/candidate_claims/{subject_slug}")
 
     source_files = sorted(
         p for p in source_dir.glob("unit-*.yaml")
@@ -75,13 +76,13 @@ def main() -> None:
     if not source_files:
         raise SystemExit(f"no source unit files found in {source_dir}")
 
-    corpus = yaml.safe_load(corpus_index_path.read_text(encoding="utf-8"))
+    corpus = yaml.safe_load(read_bytes(repo, f"canon/corpora/{subject_slug}/index.yaml", limit=2 * 1024 * 1024))
     corpus_id = corpus["spec"]["corpus_id"]
     now = utc_now()
 
     generated_ids = []
     for src_path in source_files:
-        unit = yaml.safe_load(src_path.read_text(encoding="utf-8"))
+        unit = yaml.safe_load(read_bytes(repo, src_path.relative_to(repo).as_posix(), limit=2 * 1024 * 1024))
         unit_id = unit["spec"]["source_unit_id"]
         seq = src_path.stem.replace("unit-", "")
         normalized_text = unit["spec"]["normalized_text"].strip()
@@ -180,15 +181,15 @@ def main() -> None:
             },
         }
 
-        out_path = repo / rel_path
-        out_path.write_text(yaml.safe_dump(claim, sort_keys=False), encoding="utf-8")
+        write_new_bytes(repo, rel_path, yaml.safe_dump(claim, sort_keys=False).encode("utf-8"))
         generated_ids.append(claim_id)
 
     corpus["metadata"]["updated_at"] = now
     corpus["attributes"]["temporal"]["reduced_at"] = now
     corpus["attributes"]["temporal"]["status_since"] = now
     corpus["attributes"]["operational"]["route_destination"] = "admissibility"
-    corpus_index_path.write_text(yaml.safe_dump(corpus, sort_keys=False), encoding="utf-8")
+    replace_bytes(repo, f"canon/corpora/{subject_slug}/index.yaml",
+                  yaml.safe_dump(corpus, sort_keys=False).encode("utf-8"))
 
     print(f"generated {len(generated_ids)} candidate claims for {subject_slug}")
     for claim_id in generated_ids:

@@ -42,6 +42,9 @@ approval, its SSH signature, and the allowed signers path via
 `PRIME_CANON_APPROVAL`, `PRIME_CANON_APPROVAL_SIGNATURE`, and
 `PRIME_CANON_ALLOWED_SIGNERS` respectively. An absent signer configuration
 causes a fail-closed result. No signer or approval is supplied in this pack.
+Immediately before its first output, the promotion command rechecks the clean
+exact Git revision and pins the same no-follow schema bytes used by the signed
+preflight. It opens the corpus and output parents by directory descriptor.
 
 For an approved new subject, run `python scripts/promote_nodes_and_current_state.py
 . <subject-slug>` with those environment variables set. The command rejects

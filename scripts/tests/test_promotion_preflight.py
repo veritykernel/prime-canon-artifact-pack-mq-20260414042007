@@ -17,6 +17,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from promotion_preflight import PromotionRejected, preflight
 import promote_nodes_and_current_state
+import safe_pack_io
 from publish_verified_subject import publish
 from render_binding import compute_view_hash
 from check_render_drift import inspect
@@ -152,6 +153,46 @@ class PromotionPreflightTests(unittest.TestCase):
         self.assertEqual(summary["spec"]["reviewer_refs"], ["human:reviewer"])
         self.assertIn(verified["approval_sha256"], summary["spec"]["rationale"])
         self.assertTrue((self.repo / "views" / "current" / f"{SUBJECT}.yaml").exists())
+
+    def test_promotion_rechecks_exact_revision_after_preflight(self):
+        self.make_policy_ready()
+        receipt_dir = self.repo / "receipts" / "immutable" / SUBJECT
+        for path in receipt_dir.glob("promotion-node-*.yaml"):
+            path.unlink()
+        (receipt_dir / "promotion-lane-summary.yaml").unlink()
+        for path in (self.repo / "canon" / "nodes" / SUBJECT).glob("node-*.yaml"):
+            path.unlink()
+        self.sign()
+        verified = self.check()
+        (self.repo / "README.md").write_text("later unrelated committed revision\n")
+        subprocess.run(["/usr/bin/git", "add", "README.md"], cwd=self.repo, check=True)
+        subprocess.run(["/usr/bin/git", "commit", "-qm", "later revision"], cwd=self.repo, check=True)
+        with patch.object(promote_nodes_and_current_state, "preflight", return_value=verified), \
+             patch.object(sys, "argv", ["promote", str(self.repo), SUBJECT]), \
+             self.assertRaisesRegex(SystemExit, "changed after signed preflight"):
+            promote_nodes_and_current_state.main()
+        self.assertFalse((self.repo / "canon" / "nodes" / SUBJECT / "node-0001.yaml").exists())
+
+    def test_promotion_output_parent_swap_cannot_escape_repo(self):
+        repo = self.root / "write-repo"
+        target_dir = repo / "canon" / "nodes" / SUBJECT
+        target_dir.mkdir(parents=True)
+        outside = self.root / "outside"
+        outside.mkdir()
+        original_open = safe_pack_io.os.open
+        swapped = [False]
+
+        def race_open(*args, **kwargs):
+            if args[0] == SUBJECT and kwargs.get("dir_fd") is not None and not swapped[0]:
+                target_dir.rename(repo / "canon" / "nodes" / "parked")
+                target_dir.symlink_to(outside, target_is_directory=True)
+                swapped[0] = True
+            return original_open(*args, **kwargs)
+
+        with patch.object(safe_pack_io.os, "open", side_effect=race_open), self.assertRaises(OSError):
+            promote_nodes_and_current_state.write_new(repo, target_dir / "node-9999.yaml", {"test": True})
+        self.assertTrue(swapped[0])
+        self.assertFalse((outside / "node-9999.yaml").exists())
 
     def test_changed_claim_fails_before_promotion(self):
         claim = self.repo / "canon" / "candidate_claims" / SUBJECT / "claim-0001.yaml"

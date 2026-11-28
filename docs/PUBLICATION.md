@@ -11,6 +11,9 @@ writable ancestors; it never sources the repository's `.venv`. The configured
 stage directory and its ancestors must also pass owner and write-permission
 checks. Publication remains held until these installed prerequisites and a
 current render generation are verified.
+The guard runs the external interpreter in isolated mode and loads trusted
+dependencies before adding the frozen repository scripts after site packages,
+so a checkout-local `yaml.py` cannot shadow the installed parser.
 
 The publisher checks the current view, render execution receipt, and drift
 receipt against the expected subject and output path. It reads the rendered

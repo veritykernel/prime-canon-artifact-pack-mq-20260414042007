@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from immutable_receipt import write_new
@@ -18,6 +19,8 @@ from publish_verified_subject import publish
 from safe_pack_io import ensure_directory, write_new_bytes
 from scout_contradictions_and_supersession import MAX_TOTAL_INPUT_BYTES, candidate_pairs, read_yaml as read_scout_yaml
 from verify_trusted_python import verify as verify_trusted_python
+from schema_contract import bundle as schema_bundle
+import build_rendered_projection
 import yaml
 
 SOURCE = Path(__file__).resolve().parents[2]
@@ -94,6 +97,23 @@ class ResidualGuardTests(unittest.TestCase):
         self.assertEqual(publish(self.repo, SUBJECT, stage_root=stage), target)
         self.assertEqual(target.read_bytes(), (self.repo / "views" / "rendered" / f"{SUBJECT}.md").read_bytes())
 
+    def test_failed_drift_receipt_write_does_not_advance_current_view(self):
+        self.stage_pack()
+        view = self.repo / "views" / "current" / f"{SUBJECT}.yaml"
+        original_view = view.read_bytes()
+        original_writer = build_rendered_projection.write_new
+
+        def fail_drift(repo, path, obj):
+            if path.name == "render-drift-v2.yaml":
+                raise OSError("injected drift receipt failure")
+            return original_writer(repo, path, obj)
+
+        with patch.object(build_rendered_projection, "write_new", side_effect=fail_drift), \
+             patch.object(sys, "argv", ["render", str(self.repo), SUBJECT, "v2"]), \
+             self.assertRaisesRegex(OSError, "injected drift receipt failure"):
+            build_rendered_projection.main()
+        self.assertEqual(view.read_bytes(), original_view)
+
     def test_render_builder_rejects_live_output_symlink_before_other_writes(self):
         self.stage_pack()
         output = self.repo / "views" / "rendered" / f"{SUBJECT}.md"
@@ -159,7 +179,7 @@ class ResidualGuardTests(unittest.TestCase):
         sample = self.repo / "sample.yaml"
         sample.write_text("a: b\n")
         with self.assertRaisesRegex(SystemExit, "aggregate byte budget"):
-            read_scout_yaml(sample, [MAX_TOTAL_INPUT_BYTES - 1])
+            read_scout_yaml(self.repo, sample, [MAX_TOTAL_INPUT_BYTES - 1])
 
     def test_dense_scout_candidate_set_fails_bounded(self):
         claims = [{"attributes": {"semantic": {"scope": "same"}}} for _ in range(182)]
@@ -192,6 +212,28 @@ class ResidualGuardTests(unittest.TestCase):
             write_new_bytes(self.repo, "canon/corpora/index.yaml", b"overwrite")
         self.assertEqual(sentinel.read_text(), "KEEP")
 
+    def test_candidate_builder_cannot_write_through_claim_directory_link(self):
+        self.stage_pack()
+        claim_dir = self.repo / "canon" / "candidate_claims" / SUBJECT
+        shutil.rmtree(claim_dir)
+        outside = self.root / "outside-claims"
+        outside.mkdir()
+        claim_dir.symlink_to(outside, target_is_directory=True)
+        result = subprocess.run([sys.executable, str(SOURCE / "scripts" / "extract_candidate_claims.py"),
+                                 str(self.repo), SUBJECT], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_schema_bundle_rejects_symlinked_repository_schema(self):
+        self.stage_pack()
+        schema = self.repo / "schemas" / "prime-canon-bundle.schema.json"
+        outside = self.root / "outside-schema.json"
+        outside.write_text("{}")
+        schema.unlink()
+        schema.symlink_to(outside)
+        with self.assertRaises(OSError):
+            schema_bundle(self.repo)
+
     def test_candidate_venv_cannot_run_before_publish_guard(self):
         scripts = self.repo / "scripts"
         scripts.mkdir()
@@ -208,6 +250,19 @@ class ResidualGuardTests(unittest.TestCase):
         self.assertFalse(marker.exists())
         with self.assertRaisesRegex(ValueError, "outside this repository"):
             verify_trusted_python(self.repo, self.repo.resolve() / ".venv" / "bin" / "python3")
+
+    def test_isolated_publish_import_ignores_candidate_yaml_shadow(self):
+        scripts = self.repo / "scripts"
+        scripts.mkdir()
+        marker = self.root / "yaml-shadow-imported"
+        (scripts / "yaml.py").write_text(f"from pathlib import Path\nPath({str(marker)!r}).write_text('bad')\n")
+        code = ("import sys\nimport yaml, jsonschema\n"
+                "sys.path.append(sys.argv[1])\nimport yaml\n"
+                "assert not yaml.__file__.startswith(sys.argv[1])\n")
+        result = subprocess.run([sys.executable, "-I", "-c", code, str(scripts)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(marker.exists())
 
     def test_protected_base_guard_blocks_source_and_immutable_tampering(self):
         base = self.root / "base"

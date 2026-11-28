@@ -315,6 +315,8 @@ def preflight(repo: Path, subject: str, *, approval_path: Path | None = None,
     if any(obj["spec"].get("blocker_state") != "none" for obj, _, _ in objects.values()
            if obj.get("metadata", {}).get("object_id", "").endswith(".topology-scout")):
         raise PromotionRejected("topology contradiction gate has not passed")
-    return {"corpus": corpus, "corpus_sha256": _digest(corpus_raw), "packet": packet, "summary": summary,
+    schema_raw = _bytes(repo, repo / "schemas" / "prime-canon-bundle.schema.json")
+    return {"repository_head_sha": expected["repository_head_sha"], "schema_sha256": _digest(schema_raw),
+            "corpus": corpus, "corpus_sha256": _digest(corpus_raw), "packet": packet, "summary": summary,
             "manifest": manifest, "claims": claims, "links": links,
             "reviewer": reviewer, "approval_sha256": approval_hash}

@@ -12,6 +12,7 @@ from pathlib import Path
 import yaml
 from jsonschema import Draft202012Validator
 from object_identity import index_repo
+from safe_pack_io import read_bytes
 
 
 MAX_OBJECT_BYTES = 2 * 1024 * 1024
@@ -71,15 +72,18 @@ def iso_ok(ts: str) -> bool:
         return False
 
 
-def load_yaml(path: Path):
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(fd, "rb") as stream:
-        info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_OBJECT_BYTES:
-            raise ValueError("not a bounded regular YAML file")
-        raw = stream.read(MAX_OBJECT_BYTES + 1)
-    if len(raw) > MAX_OBJECT_BYTES:
-        raise ValueError("YAML file exceeds size limit")
+def load_yaml(path: Path, repo_root: Path | None = None):
+    if repo_root is not None:
+        raw = read_bytes(repo_root, path.relative_to(repo_root).as_posix(), limit=MAX_OBJECT_BYTES)
+    else:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_OBJECT_BYTES:
+                raise ValueError("not a bounded regular YAML file")
+            raw = stream.read(MAX_OBJECT_BYTES + 1)
+        if len(raw) > MAX_OBJECT_BYTES:
+            raise ValueError("YAML file exceeds size limit")
     data = yaml.safe_load(raw)
     check_tree_bound(data)
     return data
@@ -113,10 +117,12 @@ def main() -> int:
         print(f"ERROR: missing schema bundle: {schema_path}", file=sys.stderr)
         return 2
 
-    if schema_path.stat().st_size > MAX_OBJECT_BYTES:
-        print("ERROR: schema bundle exceeds size limit", file=sys.stderr)
+    try:
+        schema_raw = read_bytes(repo_root, "schemas/prime-canon-bundle.schema.json", limit=MAX_OBJECT_BYTES)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: unsafe schema bundle: {exc}", file=sys.stderr)
         return 2
-    bundle = json.loads(schema_path.read_text(encoding="utf-8"))
+    bundle = json.loads(schema_raw)
     validators = build_validators(bundle)
 
     errors = []
@@ -134,7 +140,7 @@ def main() -> int:
             total_bytes += path.lstat().st_size
             if total_bytes > MAX_TOTAL_BYTES:
                 raise ValueError(f"aggregate YAML input exceeds {MAX_TOTAL_BYTES} bytes")
-            data = load_yaml(path)
+            data = load_yaml(path, repo_root)
         except (OSError, ValueError, yaml.YAMLError) as exc:
             errors.append(f"{rel}: {exc}")
             if len(errors) >= MAX_ERRORS:

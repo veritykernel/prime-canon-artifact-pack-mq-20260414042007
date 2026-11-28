@@ -13,6 +13,7 @@ import yaml
 
 from schema_contract import choose_enum, ensure_required_fields, validate_instance
 from immutable_receipt import assert_new, write_new
+from safe_pack_io import ensure_directory, read_bytes, replace_bytes
 
 CONTRADICTION_KIND = "PRIME_CANON_CONTRADICTION_BUNDLE_V1"
 SUPERSESSION_KIND = "PRIME_CANON_SUPERSESSION_EDGE_V1"
@@ -24,15 +25,11 @@ MAX_TOTAL_INPUT_BYTES = 64 * 1024 * 1024
 MAX_PAIR_EVALUATIONS = 16384
 
 
-def read_yaml(path: Path, budget: list[int]) -> dict:
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(fd, "rb") as stream:
-        info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_YAML_BYTES:
-            raise SystemExit(f"scout input is not a bounded regular file: {path}")
-        raw = stream.read(MAX_YAML_BYTES + 1)
-    if len(raw) > MAX_YAML_BYTES:
-        raise SystemExit(f"scout input exceeds size limit: {path}")
+def read_yaml(repo: Path, path: Path, budget: list[int]) -> dict:
+    try:
+        raw = read_bytes(repo, path.relative_to(repo).as_posix(), limit=MAX_YAML_BYTES)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"scout input is not a bounded regular file: {path}: {exc}") from exc
     budget[0] += len(raw)
     if budget[0] > MAX_TOTAL_INPUT_BYTES:
         raise SystemExit("topology scout input exceeds aggregate byte budget")
@@ -345,9 +342,8 @@ def main() -> None:
     if not corpus_index_path.exists():
         raise SystemExit(f"missing corpus index: {corpus_index_path}")
 
-    contradiction_dir.mkdir(parents=True, exist_ok=True)
-    supersession_dir.mkdir(parents=True, exist_ok=True)
-    receipt_dir.mkdir(parents=True, exist_ok=True)
+    for directory in (contradiction_dir, supersession_dir, receipt_dir):
+        ensure_directory(repo, directory.relative_to(repo).as_posix())
     summary_path = receipt_dir / "topology-scout-summary.yaml"
     assert_new(repo, summary_path)
 
@@ -362,21 +358,21 @@ def main() -> None:
         raise SystemExit(f"topology scout is limited to {MAX_CLAIMS} claims and decisions per run")
 
     budget = [0]
-    corpus = read_yaml(corpus_index_path, budget)
+    corpus = read_yaml(repo, corpus_index_path, budget)
     corpus_id = corpus["spec"]["corpus_id"]
     now = utc_now()
 
     admissibility_by_claim = {}
     cited_receipt_refs = []
     for path in admiss_files:
-        decision = read_yaml(path, budget)
+        decision = read_yaml(repo, path, budget)
         claim_ref = decision["spec"]["target_claim_ref"]
         admissibility_by_claim[claim_ref] = decision
         cited_receipt_refs.append(decision["metadata"]["object_id"])
 
     claims = []
     for path in claim_files:
-        claim = read_yaml(path, budget)
+        claim = read_yaml(repo, path, budget)
         if admissibility_passed(admissibility_by_claim.get(claim["spec"]["claim_id"], {})):
             claims.append(claim)
 
@@ -461,7 +457,8 @@ def main() -> None:
     corpus["attributes"]["temporal"]["reduced_at"] = now
     corpus["attributes"]["temporal"]["status_since"] = now
     corpus["attributes"]["operational"]["route_destination"] = route_destination
-    corpus_index_path.write_text(yaml.safe_dump(corpus, sort_keys=False), encoding="utf-8")
+    replace_bytes(repo, f"canon/corpora/{subject_slug}/index.yaml",
+                  yaml.safe_dump(corpus, sort_keys=False).encode("utf-8"))
 
     print(f"generated {len(contradiction_refs)} contradiction bundles for {subject_slug}")
     for ref in contradiction_refs:
