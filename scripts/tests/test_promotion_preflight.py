@@ -173,6 +173,37 @@ class PromotionPreflightTests(unittest.TestCase):
             promote_nodes_and_current_state.main()
         self.assertFalse((self.repo / "canon" / "nodes" / SUBJECT / "node-0001.yaml").exists())
 
+    def test_promotion_rechecks_revision_after_build_before_first_output(self):
+        self.make_policy_ready()
+        receipt_dir = self.repo / "receipts" / "immutable" / SUBJECT
+        for path in receipt_dir.glob("promotion-node-*.yaml"):
+            path.unlink()
+        (receipt_dir / "promotion-lane-summary.yaml").unlink()
+        for path in (self.repo / "canon" / "nodes" / SUBJECT).glob("node-*.yaml"):
+            path.unlink()
+        self.sign()
+        verified = self.check()
+        original_validate = promote_nodes_and_current_state.validate_instance
+        changed = [False]
+
+        def change_revision_during_build(repo, obj):
+            if not changed[0]:
+                (repo / "README.md").write_text("committed after signed preflight\n")
+                subprocess.run(["/usr/bin/git", "add", "README.md"], cwd=repo, check=True)
+                subprocess.run(["/usr/bin/git", "commit", "-qm", "concurrent revision"], cwd=repo, check=True)
+                changed[0] = True
+            return original_validate(repo, obj)
+
+        with patch.object(promote_nodes_and_current_state, "preflight", return_value=verified), \
+             patch.object(promote_nodes_and_current_state, "validate_instance",
+                          side_effect=change_revision_during_build), \
+             patch.object(sys, "argv", ["promote", str(self.repo), SUBJECT]), \
+             self.assertRaisesRegex(SystemExit, "changed before first governed output"):
+            promote_nodes_and_current_state.main()
+        self.assertTrue(changed[0])
+        self.assertFalse((receipt_dir / "promotion-node-0001.yaml").exists())
+        self.assertFalse((self.repo / "views" / "current" / f"{SUBJECT}.yaml").exists())
+
     def test_promotion_output_parent_swap_cannot_escape_repo(self):
         repo = self.root / "write-repo"
         target_dir = repo / "canon" / "nodes" / SUBJECT

@@ -116,6 +116,7 @@ def main() -> None:
     node_receipt_ids = []
     all_source_refs = []
     all_source_unit_refs = []
+    pending_writes: list[tuple[Path, dict]] = []
 
     for claim_id in target_claim_ids:
         claim_path = claim_paths_by_id[claim_id]
@@ -314,8 +315,7 @@ def main() -> None:
         ensure_required_fields(repo, NODE_KIND, node["spec"])
         validate_instance(repo, node)
 
-        write_new(repo, repo / receipt_rel_path, receipt)
-        write_new(repo, repo / node_rel_path, node)
+        pending_writes.extend(((repo / receipt_rel_path, receipt), (repo / node_rel_path, node)))
 
         node_ids.append(node_id)
         node_receipt_ids.append(receipt_id)
@@ -482,19 +482,30 @@ def main() -> None:
     ensure_required_fields(repo, RECEIPT_KIND, lane_summary["spec"])
     validate_instance(repo, lane_summary)
 
-    write_new(repo, repo / view_rel_path, current_view)
-    write_new(repo, repo / lane_summary_rel_path, lane_summary)
-
     corpus["metadata"]["updated_at"] = now
     corpus["attributes"]["temporal"]["reduced_at"] = now
     corpus["attributes"]["temporal"]["status_since"] = now
     corpus["attributes"]["operational"]["route_destination"] = "render-projection"
-    corpus_stream.seek(0)
-    corpus_stream.truncate()
-    corpus_stream.write(yaml.safe_dump(corpus, sort_keys=False).encode("utf-8"))
-    corpus_stream.flush()
-    os.fsync(corpus_stream.fileno())
-    corpus_stream.close()
+    try:
+        try:
+            current_revision = repository_revision(repo)
+        except PromotionRejected as exc:
+            raise SystemExit("promotion repository changed before first governed output") from exc
+        if current_revision != frozen["repository_head_sha"]:
+            raise SystemExit("promotion repository changed before first governed output")
+        for path, obj in pending_writes:
+            write_new(repo, path, obj)
+        write_new(repo, repo / lane_summary_rel_path, lane_summary)
+        corpus_stream.seek(0)
+        corpus_stream.truncate()
+        corpus_stream.write(yaml.safe_dump(corpus, sort_keys=False).encode("utf-8"))
+        corpus_stream.flush()
+        os.fsync(corpus_stream.fileno())
+        # A current view is the publication pointer; install it only after every
+        # referenced receipt, node and corpus update has completed.
+        write_new(repo, repo / view_rel_path, current_view)
+    finally:
+        corpus_stream.close()
 
     print(view_id)
     print(f"promoted_nodes={len(node_ids)}")
