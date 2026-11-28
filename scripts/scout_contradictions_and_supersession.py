@@ -20,11 +20,12 @@ RECEIPT_KIND = "PRIME_CANON_REDUCTION_DECISION_RECEIPT_V1"
 MAX_CLAIMS = 512
 MAX_TEXT = 8192
 MAX_YAML_BYTES = 2 * 1024 * 1024
+MAX_TOTAL_INPUT_BYTES = 64 * 1024 * 1024
 MAX_PAIR_EVALUATIONS = 16384
 
 
-def read_yaml(path: Path) -> dict:
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+def read_yaml(path: Path, budget: list[int]) -> dict:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as stream:
         info = os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_YAML_BYTES:
@@ -32,6 +33,9 @@ def read_yaml(path: Path) -> dict:
         raw = stream.read(MAX_YAML_BYTES + 1)
     if len(raw) > MAX_YAML_BYTES:
         raise SystemExit(f"scout input exceeds size limit: {path}")
+    budget[0] += len(raw)
+    if budget[0] > MAX_TOTAL_INPUT_BYTES:
+        raise SystemExit("topology scout input exceeds aggregate byte budget")
     return yaml.safe_load(raw)
 
 def utc_now() -> str:
@@ -357,21 +361,22 @@ def main() -> None:
     if len(claim_files) > MAX_CLAIMS or len(admiss_files) > MAX_CLAIMS:
         raise SystemExit(f"topology scout is limited to {MAX_CLAIMS} claims and decisions per run")
 
-    corpus = read_yaml(corpus_index_path)
+    budget = [0]
+    corpus = read_yaml(corpus_index_path, budget)
     corpus_id = corpus["spec"]["corpus_id"]
     now = utc_now()
 
     admissibility_by_claim = {}
     cited_receipt_refs = []
     for path in admiss_files:
-        decision = read_yaml(path)
+        decision = read_yaml(path, budget)
         claim_ref = decision["spec"]["target_claim_ref"]
         admissibility_by_claim[claim_ref] = decision
         cited_receipt_refs.append(decision["metadata"]["object_id"])
 
     claims = []
     for path in claim_files:
-        claim = read_yaml(path)
+        claim = read_yaml(path, budget)
         if admissibility_passed(admissibility_by_claim.get(claim["spec"]["claim_id"], {})):
             claims.append(claim)
 

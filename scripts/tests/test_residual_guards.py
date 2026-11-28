@@ -16,7 +16,7 @@ from check_publish_guard_trusted import FROZEN_FILES, check_candidate
 from object_identity import index_repo
 from publish_verified_subject import publish
 from safe_pack_io import ensure_directory, write_new_bytes
-from scout_contradictions_and_supersession import candidate_pairs
+from scout_contradictions_and_supersession import MAX_TOTAL_INPUT_BYTES, candidate_pairs, read_yaml as read_scout_yaml
 from verify_trusted_python import verify as verify_trusted_python
 import yaml
 
@@ -148,6 +148,18 @@ class ResidualGuardTests(unittest.TestCase):
     def test_validator_rejects_large_scalar_within_file_budget(self):
         with self.assertRaisesRegex(ValueError, "scalar exceeds size limit"):
             check_tree_bound({"payload": "x" * (MAX_SCALAR_CHARS + 1)})
+
+    def test_yaml_fifo_rejected_without_waiting_for_writer(self):
+        fifo = self.repo / "blocked.yaml"
+        os.mkfifo(fifo)
+        with self.assertRaisesRegex(ValueError, "bounded regular"):
+            load_yaml(fifo)
+
+    def test_scout_aggregate_byte_budget_holds(self):
+        sample = self.repo / "sample.yaml"
+        sample.write_text("a: b\n")
+        with self.assertRaisesRegex(SystemExit, "aggregate byte budget"):
+            read_scout_yaml(sample, [MAX_TOTAL_INPUT_BYTES - 1])
 
     def test_dense_scout_candidate_set_fails_bounded(self):
         claims = [{"attributes": {"semantic": {"scope": "same"}}} for _ in range(182)]
